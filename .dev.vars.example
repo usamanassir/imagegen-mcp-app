@@ -1,0 +1,5 @@
+# Secrets for this Worker. The Deploy to Cloudflare button asks for each one.
+# For local development (npm run dev), copy this file to .dev.vars and fill it in.
+MCP_TOKEN=
+OPENAI_API_KEY=
+GEMINI_API_KEY=

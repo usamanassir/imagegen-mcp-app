@@ -1,0 +1,40 @@
+{
+  "name": "imagegen-mcp-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remote MCP server (Cloudflare Worker) that lets Claude generate and edit images with OpenAI GPT Image 2.5 and Google Nano Banana.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.157.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "MCP_TOKEN": {
+        "description": "A long random string (at least 16 characters; let your password manager generate one). It is the password in your Claude connector URL: `https://<worker>.workers.dev/mcp/<MCP_TOKEN>`. Save it somewhere, you'll need it in the next step."
+      },
+      "OPENAI_API_KEY": {
+        "description": "Your [OpenAI API key](https://platform.openai.com/api-keys), used for the GPT Image 2.5 models."
+      },
+      "GEMINI_API_KEY": {
+        "description": "Your [Gemini API key](https://aistudio.google.com/app/apikey), used for the Nano Banana models."
+      },
+      "IMAGES": {
+        "description": "R2 bucket where generated images are stored (R2 must be enabled on your account once)."
+      },
+      "DEFAULT_MODEL": {
+        "description": "Model used when you don't name one: `gpt-image-2.5-flare`, `gpt-image-2.5-sunburst`, `gemini-nano-banana-2.1` or `gemini-3.1-flash-image`."
+      },
+      "DEFAULT_QUALITY": {
+        "description": "Default OpenAI quality: `low`, `medium`, `high`, `xhigh`, `max` or `auto`."
+      },
+      "DAILY_LIMIT": {
+        "description": "Maximum images per day (UTC), a safety net against runaway costs. `0` turns it off."
+      }
+    }
+  }
+}

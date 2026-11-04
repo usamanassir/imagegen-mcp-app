@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "imagegen-mcp-app",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  // Generated images are stored here and served from /img/<id>.<ext>.
+  // Create it once with: npx wrangler r2 bucket create imagegen-images
+  "r2_buckets": [{ "binding": "IMAGES", "bucket_name": "imagegen-images","preview_bucket_name": "imagegen-images" }],
+
+  // Secrets are NOT set here. Set them with `npx wrangler secret put <NAME>`:
+  //   MCP_TOKEN       long random string; it goes into your connector URL
+  //   OPENAI_API_KEY  for gpt-image-2.5-flare / gpt-image-2.5-sunburst
+  //   GEMINI_API_KEY  for gemini-nano-banana-2.1 / gemini-3.1-flash-image
+  "vars": {
+    "DEFAULT_MODEL": "gpt-image-2.5-flare",
+    "DEFAULT_QUALITY": "auto",
+    "DAILY_LIMIT": "100"
+  }
+}
