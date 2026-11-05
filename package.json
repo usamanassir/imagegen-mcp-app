@@ -34,6 +34,9 @@
       },
       "DAILY_LIMIT": {
         "description": "Maximum images per day (UTC), a safety net against runaway costs. `0` turns it off."
+      },
+      "RETENTION_DAYS": {
+        "description": "Images older than this many days are deleted automatically. `0` keeps them forever."
       }
     }
   }

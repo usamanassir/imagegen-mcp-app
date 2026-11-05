@@ -18,6 +18,11 @@
   "vars": {
     "DEFAULT_MODEL": "gpt-image-2.5-flare",
     "DEFAULT_QUALITY": "auto",
-    "DAILY_LIMIT": "100"
-  }
+    "DAILY_LIMIT": "100",
+    // Images older than this many days are deleted by the daily cron below. "0" keeps them forever.
+    "RETENTION_DAYS": "14"
+  },
+
+  // Runs once a day (03:23 UTC) to delete images older than RETENTION_DAYS.
+  "triggers": { "crons": ["23 3 * * *"] }
 }

@@ -2,17 +2,21 @@
 // Quick check of a deployed imagegen-mcp server (Node 18+, no dependencies).
 //
 //   node scripts/check.mjs "https://imagegen-mcp.<you>.workers.dev/mcp/<MCP_TOKEN>"
-//   node scripts/check.mjs "<connector URL>" --generate "a red bicycle in the rain" [--model gemini-nano-banana-2.1]
+//   node scripts/check.mjs "<connector URL>" --generate "a red bicycle in the rain" [--model gemini-nano-banana-2.1] [--count 2]
 //   node scripts/check.mjs "<connector URL>" --upload photo.jpg
+//   node scripts/check.mjs "<connector URL>" --list [--query logo]
 //
-// The second form makes one real image (billed by OpenAI/Google) and prints its link.
+// The second form makes real images (billed by OpenAI/Google) and prints their links.
 // The third uploads a local image through create_upload_link (free) and prints its id.
+// The fourth lists stored images, newest first.
 
 import { readFile } from "node:fs/promises";
 
 const [url, ...rest] = process.argv.slice(2);
 if (!url || !/^https?:\/\//.test(url)) {
-  console.error('Usage: node scripts/check.mjs "<connector URL>" [--generate "<prompt>"] [--model <model>] [--upload <file>]');
+  console.error(
+    'Usage: node scripts/check.mjs "<connector URL>" [--generate "<prompt>"] [--model <model>] [--count <n>] [--upload <file>] [--list] [--query <text>]',
+  );
   process.exit(2);
 }
 const flag = (name) => {
@@ -72,6 +76,7 @@ try {
   if (prompt) {
     const args = { prompt };
     if (flag("--model")) args.model = flag("--model");
+    if (flag("--count")) args.count = Number(flag("--count"));
     console.log("… generating (this can take up to a minute)");
     const started = Date.now();
     const result = await rpc("tools/call", { name: "generate_image", arguments: args });
@@ -81,8 +86,14 @@ try {
       process.exit(1);
     }
     console.log(`✔ Done in ${Math.round((Date.now() - started) / 1000)} s\n${text}`);
-  } else if (!uploadFile) {
+  } else if (!uploadFile && !rest.includes("--list")) {
     console.log("All good. Add --generate \"<prompt>\" to make a test image.");
+  }
+  if (rest.includes("--list")) {
+    const args = {};
+    if (flag("--query")) args.query = flag("--query");
+    const result = await rpc("tools/call", { name: "list_images", arguments: args });
+    console.log(result.content.filter((c) => c.type === "text").map((c) => c.text).join("\n"));
   }
 } catch (err) {
   console.error(`✘ ${err.message}`);

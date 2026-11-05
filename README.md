@@ -1,12 +1,13 @@
 # imagegen-mcp: image generation for Claude (web, phone, desktop)
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/usamanassir/imagegen-mcp)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/usamanassir/imagegen-mcp-app)
 
 A small remote MCP server on **Cloudflare Workers** that gives Claude these tools:
 
 - **`generate_image`**: creates a new image from a description.
 - **`edit_image`**: changes earlier images or combines several reference images.
 - **`create_upload_link`**: lets Claude upload an image you attached in the chat so it can edit or restore it.
+- **`list_images`**: finds earlier images by date or prompt, so you can say "edit the logo from yesterday".
 
 It works with **OpenAI GPT Image 2.5** (Flare, Sunburst) and **Google Nano Banana** (2.1 and 2). Images are saved
 in Cloudflare R2, and each one gets its own link. Claude also gets a copy of the image so it can look
@@ -43,8 +44,8 @@ Desktop.
    - `OPENAI_API_KEY` and `GEMINI_API_KEY`: your API keys.
 
    Leave the other settings as they are and tap **Deploy**.
-4. **Open your Worker's address** (`https://imagegen-mcp.<your-subdomain>.workers.dev`). It shows a setup check.
-   Every line should have a ✓. If one doesn't, fix it in the dashboard under **Workers & Pages → imagegen-mcp →
+4. **Open your Worker's address** (`https://imagegen-mcp-app.<your-subdomain>.workers.dev`). It shows a setup check.
+   Every line should have a ✓. If one doesn't, fix it in the dashboard under **Workers & Pages → imagegen-mcp-app →
    Settings → Variables and Secrets**.
 
 Your **connector URL** is that address followed by `/mcp/<MCP_TOKEN>`. Now go to step 2 below.
@@ -52,12 +53,12 @@ Your **connector URL** is that address followed by `/mcp/<MCP_TOKEN>`. Now go to
 ### Option B: from a computer (about 10 minutes)
 
 ```bash
-git clone https://github.com/usamanassir/imagegen-mcp
-cd imagegen-mcp
+git clone https://github.com/usamanassir/imagegen-mcp-app
+cd imagegen-mcp-app
 npm install
 npx wrangler login                                  # opens the browser and signs you in to Cloudflare
 npx wrangler r2 bucket create imagegen-images       # the bucket for the images
-npx wrangler deploy                                 # prints https://imagegen-mcp.<your-subdomain>.workers.dev
+npx wrangler deploy                                 # prints https://imagegen-mcp-app.<your-subdomain>.workers.dev
 ```
 
 The first time you deploy, Wrangler may ask you to pick a `workers.dev` subdomain. If creating the bucket says
@@ -78,13 +79,13 @@ Secrets take effect right away. You don't need to redeploy.
 Your **connector URL** is:
 
 ```
-https://imagegen-mcp.<your-subdomain>.workers.dev/mcp/<MCP_TOKEN>
+https://imagegen-mcp-app.<your-subdomain>.workers.dev/mcp/<MCP_TOKEN>
 ```
 
 Check that it works. The second command makes one real (billed) test image:
 
 ```bash
-node scripts/check.mjs "https://imagegen-mcp.<your-subdomain>.workers.dev/mcp/<MCP_TOKEN>"
+node scripts/check.mjs "https://imagegen-mcp-app.<your-subdomain>.workers.dev/mcp/<MCP_TOKEN>"
 node scripts/check.mjs "<connector URL>" --generate "a lighthouse at dusk, oil painting"
 ```
 
@@ -126,10 +127,26 @@ Claude Code needs no setup, since it runs `curl` on your own machine. The upload
 
 To test the upload from a computer: `node scripts/check.mjs "<connector URL>" --upload photo.jpg`
 
-**If you'd rather not put the token in the URL**, use `https://…workers.dev/mcp` as the URL and add the request
-header `Authorization: Bearer <MCP_TOKEN>` in the connector's settings.
+### Variations, history and the inline viewer
+
+- **Variations:** ask for "3 options" or "a few versions" and Claude sets `count` (up to 4). Each variation is
+  billed as one image and counts toward `DAILY_LIMIT`. The result lists every link, and you pick one to continue
+  editing.
+- **History:** say "edit the café logo from yesterday" and Claude calls `list_images`, which returns your stored
+  images newest first with the prompt and model that made each one. It matches on the prompt text and date, not on
+  what the image looks like, so Claude may show you the candidates and ask which one you mean. Images are only
+  listed while they are stored (see `RETENTION_DAYS`).
+- **Viewer:** in apps that support MCP Apps, the result appears inline with Open, Download and Copy-link buttons,
+  a grid for variations and lists, and a before/after pair for edits. On hosts that let apps call server tools, an
+  **Upload an image to edit…** button sends a file from your device and posts its id into the chat. Whether that
+  button appears depends on the host.
+
+**Bearer token instead of the URL token:** claude.ai's custom connector form only takes a URL, so there the token
+has to be in the URL. Clients that let you set request headers, such as Claude Code and most MCP SDKs, can use
+`https://…workers.dev/mcp` as the URL with `Authorization: Bearer <MCP_TOKEN>` instead.
 
 **Claude Code:** `claude mcp add --transport http imagegen "<connector URL>"`
+(or `claude mcp add --transport http imagegen https://…workers.dev/mcp --header "Authorization: Bearer <MCP_TOKEN>"`)
 
 ## Models and options
 
@@ -144,9 +161,10 @@ A model only appears if its provider's key is set. Claude picks the options from
 
 - `aspect_ratio`: 1:1, 2:3, 3:2, 3:4, 4:3, 9:16, 16:9 or 21:9.
 - `resolution`: 1K (default), 2K or 4K.
-- `quality` (OpenAI only): low, medium (default), high, xhigh, max or auto.
+- `quality` (OpenAI only): low, medium, high, xhigh, max or auto. The default is `DEFAULT_QUALITY` (`auto`).
 - `format` (OpenAI only): jpeg (default), png or webp.
 - `background` (OpenAI only): transparent or opaque.
+- `count`: 1 (default) to 4 variations in one call.
 
 To add another model from the same providers, add a line to `MODELS` at the top of `src/index.js` and run
 `npm run deploy`.
@@ -158,9 +176,10 @@ Change these in `wrangler.jsonc` → `vars`, then run `npm run deploy`:
 | Variable | Default | What it does |
 |---|---|---|
 | `DEFAULT_MODEL` | `gpt-image-2.5-flare` | The model used when you don't name one |
-| `DEFAULT_QUALITY` | `medium` | The default OpenAI quality |
+| `DEFAULT_QUALITY` | `auto` | The default OpenAI quality (`medium` if the value is unset or invalid) |
 | `DAILY_LIMIT` | `100` | The most images per day (UTC); `0` turns the limit off |
-| `PREVIEW_MAX_BYTES` | `1500000` | Images bigger than this are sent to Claude as a link only |
+| `RETENTION_DAYS` | `14` | Images older than this are deleted by a daily job (03:23 UTC); `0` keeps them forever |
+| `PREVIEW_MAX_BYTES` | `1500000` | Total size of the image copies sent to Claude per call; bigger results are sent as links only |
 | `PREVIEW_TO_CLAUDE` | `true` | `false` means Claude never gets a copy of the image, which saves tokens |
 | `ALLOWED_ORIGINS` | — | Extra browser origins allowed to call `/mcp` (claude.ai and localhost are always allowed) |
 
@@ -172,8 +191,10 @@ Change these in `wrangler.jsonc` → `vars`, then run `npm run deploy`:
   Google doesn't count toward that, and 1K images fit easily. Large 2K/4K outputs, especially Nano Banana PNGs, can
   go over it. If a call fails with *"Worker exceeded CPU time limit"* (error 1102), switch to **Workers Paid**
   ($5/month), or stick to 1K.
-- **R2** gives you 10 GB free with no download fees. To delete old images automatically after 30 days:
-  `npx wrangler r2 bucket lifecycle add imagegen-images expire-old img/ --expire-days 30`
+- **R2** gives you 10 GB free with no download fees. `RETENTION_DAYS` deletes old images for you (14 days by
+  default), so the bucket stays small. Set it to `0` if you want to keep everything.
+- `DAILY_LIMIT` is checked with a read-then-write, so two calls that start at the same moment can go slightly over
+  it. For one person's use that doesn't matter.
 
 ## Security notes
 
@@ -201,6 +222,11 @@ Change these in `wrangler.jsonc` → `vars`, then run `npm run deploy`:
 - `PUT /upload/<link>` accepts one image (raw body or multipart form) for a link made by `create_upload_link`. The
   link is `<id>.<expiry>.<HMAC signature>`, so the server keeps no state for it; it is spent once the image exists.
 - `ui://imagegen/viewer.html` is a small MCP App (spec 2026-01-26) that shows the image in the chat.
+- `list_images` reads the metadata of the stored images from R2 (prompt, model, date) and sorts them newest first.
+  It looks through at most 5,000 images.
+- A cron trigger (`triggers.crons` in `wrangler.jsonc`) runs once a day and deletes images older than
+  `RETENTION_DAYS`. To try it locally: `npx wrangler dev --test-scheduled`, then open
+  `http://localhost:8787/__scheduled`.
 - OpenAI is called through `/v1/images/generations` and `/v1/images/edits`. Google is called through
   `models/<id>:generateContent` with image output. The code is all in `src/index.js` and `src/viewer.js` and has no
   runtime dependencies.

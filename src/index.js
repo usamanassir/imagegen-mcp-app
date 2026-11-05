@@ -9,6 +9,8 @@
  *   GET  /img/<id>.<ext>    Generated images (public, unguessable ids, stored in R2)
  *   PUT  /upload/<link>     Single-use upload link from the create_upload_link tool (raw body or multipart)
  *
+ * A daily cron (see "triggers" in wrangler.jsonc) deletes images older than RETENTION_DAYS.
+ *
  * Secrets (npx wrangler secret put NAME): MCP_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY
  * Settings ("vars" in wrangler.jsonc): DEFAULT_MODEL, DEFAULT_QUALITY, DAILY_LIMIT, ...
  */
@@ -60,16 +62,21 @@ const BACKGROUNDS = ["auto", "transparent", "opaque"];
 const MAX_PROMPT_CHARS = 32000;
 const MAX_INPUT_IMAGES = 8;
 const MAX_INPUT_BYTES = 20 * 1024 * 1024;
-const DEFAULT_PREVIEW_MAX_BYTES = 1_500_000; // larger images are linked only (keeps CPU low on the Workers Free plan)
+const MAX_COUNT = 4; // variations per call
+const MAX_LIST = 50; // images per list_images call
+const MAX_LIST_SCAN = 5000; // most stored images list_images will look through
+const DEFAULT_PREVIEW_MAX_BYTES = 1_500_000; // total preview bytes per call; larger results are linked only (keeps CPU low on the Workers Free plan)
 const UPLOAD_LINK_TTL_MS = 10 * 60 * 1000;
 
 const INSTRUCTIONS = [
   "Image generation tools.",
   "Use generate_image when the user wants a new picture (photo, illustration, logo, poster, icon, mockup art).",
   "Use edit_image to change or remix an image: pass the URL of an image returned earlier (or a public image URL).",
+  "Set count (2-4) when the user wants several variations to choose from.",
   "If the user attached an image in the chat (e.g. to restore, fix or edit it), you can't pass the attachment directly:",
   "call create_upload_link, upload the file with the curl command it returns from your code execution environment,",
   "then call edit_image with the returned image id.",
+  "Use list_images to find images from earlier conversations (e.g. 'the logo from yesterday') by date or prompt text.",
   "Write rich prompts: subject, setting, style or medium, composition, lighting, colors, mood; put any text that must appear in the image in quotes.",
   "After each call, give the user the image link from the result so they can open or download it.",
 ].join(" ");
@@ -98,6 +105,11 @@ export default {
       return new Response("Internal error\n", { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
   },
+
+  // Cron trigger: delete images older than RETENTION_DAYS (0 or unset keeps everything).
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(purgeOldImages(env));
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -106,7 +118,7 @@ export default {
 
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+  "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
   "access-control-allow-headers":
     "authorization, content-type, accept, mcp-protocol-version, mcp-session-id, last-event-id",
   "access-control-expose-headers": "mcp-session-id, mcp-protocol-version, www-authenticate",
@@ -299,6 +311,7 @@ async function handleRequest(method, params, state) {
     case "tools/call": {
       const name = params.name;
       if (name === "create_upload_link") return { result: await createUploadLink(state) };
+      if (name === "list_images") return { result: await listImages(state, params.arguments || {}) };
       if (name !== "generate_image" && name !== "edit_image") {
         throw new RpcError(-32602, `Unknown tool: ${name}`);
       }
@@ -329,7 +342,13 @@ async function handleRequest(method, params, state) {
               uri: UI_URI,
               mimeType: UI_MIME,
               text: VIEWER_HTML,
-              _meta: { ui: { csp: { resourceDomains: [state.origin] }, prefersBorder: true } },
+              _meta: {
+                ui: {
+                  // Images load from this origin; the viewer's upload button also PUTs to it.
+                  csp: { resourceDomains: [state.origin], connectDomains: [state.origin] },
+                  prefersBorder: true,
+                },
+              },
             },
           ],
         },
@@ -396,6 +415,13 @@ function toolDefinitions(env, ui) {
       enum: BACKGROUNDS,
       description: "OpenAI models only. 'transparent' needs png or webp and is not supported by every model.",
     },
+    count: {
+      type: "integer",
+      minimum: 1,
+      maximum: MAX_COUNT,
+      default: 1,
+      description: `Number of variations to make in one call (1-${MAX_COUNT}). Each one is billed as a separate image.`,
+    },
   };
   const annotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
   const meta = ui ? { _meta: { ui: { resourceUri: UI_URI } } } : {};
@@ -406,7 +432,7 @@ function toolDefinitions(env, ui) {
       title: "Generate image",
       description:
         "Create a new image from a text description. Returns a public link to the full-size image (always share it with the user) " +
-        "and the image itself so you can check the result. Takes roughly 10-60 seconds.",
+        "and the image itself so you can check the result. Set count to 2-4 for variations. Takes roughly 10-60 seconds.",
       inputSchema: {
         type: "object",
         properties: {
@@ -476,6 +502,27 @@ function toolDefinitions(env, ui) {
         openWorldHint: false,
       },
     },
+    {
+      name: "list_images",
+      title: "List images",
+      description:
+        "List images stored on this server, newest first, with the prompt and model that made each one. Use it to find images " +
+        "from earlier conversations (e.g. 'the café logo from yesterday'): filter with query, then pass the id or link to edit_image. " +
+        "When several images match, show the user the candidates and ask which one they mean.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Optional. Case-insensitive text to look for in the prompt, model or image id.",
+          },
+          limit: { type: "integer", minimum: 1, maximum: MAX_LIST, default: 20, description: "How many images to return." },
+        },
+        additionalProperties: false,
+      },
+      annotations: { title: "List images", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      ...meta,
+    },
   ];
 }
 
@@ -504,9 +551,15 @@ function normalizeArgs(tool, args, env) {
     quality: pick("quality", QUALITIES, defaultQuality(env)),
     format: pick("format", FORMATS, "jpeg"),
     background: pick("background", BACKGROUNDS, undefined),
+    count: 1,
     images: [],
   };
   if (opts.background === "transparent" && opts.format === "jpeg") opts.format = "png";
+  if (args.count !== undefined) {
+    const n = Number(args.count);
+    if (!Number.isInteger(n) || n < 1 || n > MAX_COUNT) throw new ToolError(`'count' must be a whole number from 1 to ${MAX_COUNT}.`);
+    opts.count = n;
+  }
 
   if (tool === "edit_image") {
     if (!Array.isArray(args.images) || args.images.length === 0) {
@@ -528,7 +581,7 @@ async function runImageTool(tool, args, state) {
     }
     if (!env.IMAGES) throw new ToolError("R2 bucket binding IMAGES is missing (see wrangler.jsonc).");
 
-    const usage = await checkDailyLimit(env);
+    const usage = await checkDailyLimit(env, opts.count);
     const inputs = tool === "edit_image" ? await loadInputImages(env, origin, opts.images) : [];
 
     // First input image decides the shape of an edit when no aspect ratio was given.
@@ -540,48 +593,86 @@ async function runImageTool(tool, args, state) {
       opts.provider === "openai"
         ? await openAiImage(env, opts, inputs, sizeHint)
         : await geminiImage(env, opts, inputs);
-    const bytes = Buffer.from(gen.b64, "base64");
-    const mimeType = sniffMime(bytes) || gen.mimeType || "image/png";
-    const dims = imageDimensions(bytes);
 
-    const stored = await storeImage(env, origin, bytes, mimeType, {
-      model: opts.model,
-      tool,
-      prompt: truncateUtf8(opts.prompt, 600),
-      created: new Date().toISOString(),
-    });
-    await bumpDailyCount(env, usage);
+    const created = new Date().toISOString();
+    const results = [];
+    for (const g of gen.images) {
+      const bytes = Buffer.from(g.b64, "base64");
+      const mimeType = sniffMime(bytes) || g.mimeType || "image/png";
+      const stored = await storeImage(env, origin, bytes, mimeType, {
+        model: opts.model,
+        tool,
+        prompt: truncateUtf8(opts.prompt, 600),
+        created,
+      });
+      results.push({ ...stored, bytes, mimeType, dims: imageDimensions(bytes) });
+    }
+    await bumpDailyCount(env, usage, results.length);
     console.log(
-      JSON.stringify({ event: "image", tool, model: opts.model, ms: Date.now() - started, bytes: bytes.length, dims }),
+      JSON.stringify({
+        event: "image",
+        tool,
+        model: opts.model,
+        count: results.length,
+        ms: Date.now() - started,
+        bytes: results.reduce((n, r) => n + r.bytes.length, 0),
+      }),
     );
 
+    // Attach previews while they fit the total budget (base64 of big images costs CPU and tokens).
     const previewMax = clampInt(env.PREVIEW_MAX_BYTES, 0, 4_500_000, DEFAULT_PREVIEW_MAX_BYTES);
-    const attachPreview = env.PREVIEW_TO_CLAUDE !== "false" && bytes.length <= previewMax;
-    const size = dims ? `${dims.width}x${dims.height}` : "unknown size";
-    const lines = [
-      `Image ready: ${stored.url}`,
-      `Model: ${MODELS[opts.model].label} · ${size} · ${mimeType}`,
-      `Image id: ${stored.id} (pass the link to edit_image to change it)`,
-      "Share the link with the user so they can open or download the full-size image.",
-    ];
+    let budget = env.PREVIEW_TO_CLAUDE === "false" ? -1 : previewMax;
+    const lines = [];
+    const content = [];
+    const images = [];
+    const many = results.length > 1;
+    results.forEach((r, i) => {
+      const size = r.dims ? `${r.dims.width}x${r.dims.height}` : "unknown size";
+      lines.push(`${many ? `Image ${i + 1}: ` : "Image ready: "}${r.url}`);
+      lines.push(`${many ? "  " : ""}Image id: ${r.id} · ${size} · ${r.mimeType}`);
+      const attach = budget >= r.bytes.length;
+      if (attach) budget -= r.bytes.length;
+      images.push({
+        url: r.url,
+        id: r.id,
+        width: r.dims?.width ?? null,
+        height: r.dims?.height ?? null,
+        mimeType: r.mimeType,
+        bytes: r.bytes.length,
+        preview: attach,
+      });
+      // Re-encode from the decoded bytes so the payload is guaranteed to be plain base64.
+      if (attach) content.push({ type: "image", data: r.bytes.toString("base64"), mimeType: r.mimeType });
+    });
+    lines.push(`Model: ${MODELS[opts.model].label}`);
+    lines.push(
+      many
+        ? "Share the links with the user and ask which one they prefer. Pass a link or id to edit_image to change it."
+        : "Share the link with the user so they can open or download the full-size image. Pass it to edit_image to change it.",
+    );
     if (gen.note) lines.push(`Model note: ${gen.note}`);
-    if (!attachPreview) lines.push("(The image is large, so it is not attached here; open the link to see it.)");
+    if (gen.failed) lines.push(`Note: ${gen.failed} of ${opts.count} variations failed: ${gen.failedReason}`);
+    if (images.some((im) => !im.preview)) lines.push("(Some images are large and not attached here; open the links to see them.)");
 
-    const content = [{ type: "text", text: lines.join("\n") }];
-    // Re-encode from the decoded bytes so the payload is guaranteed to be plain base64.
-    if (attachPreview) content.push({ type: "image", data: bytes.toString("base64"), mimeType });
+    content.unshift({ type: "text", text: lines.join("\n") });
+    const first = images[0];
     return {
       content,
       structuredContent: {
-        url: stored.url,
-        id: stored.id,
+        // Fields for the first image (kept for compatibility) …
+        url: first.url,
+        id: first.id,
         model: opts.model,
         modelLabel: MODELS[opts.model].label,
         provider: opts.provider,
-        width: dims?.width ?? null,
-        height: dims?.height ?? null,
-        mimeType,
-        bytes: bytes.length,
+        width: first.width,
+        height: first.height,
+        mimeType: first.mimeType,
+        bytes: first.bytes,
+        // … and the full set, plus the inputs of an edit so the viewer can show before/after.
+        count: images.length,
+        images,
+        sources: inputs.map((inp) => ({ url: inp.url, id: inp.id ?? null })),
       },
     };
   } catch (err) {
@@ -601,7 +692,8 @@ async function openAiImage(env, opts, inputs, sizeHint) {
   const size = sizeHint
     ? openAiSize(`${sizeHint.width}:${sizeHint.height}`, opts.resolution)
     : openAiSize(opts.aspectRatio || "1:1", opts.resolution);
-  const fields = { model: opts.model, prompt: opts.prompt, size, quality: opts.quality, output_format: opts.format, n: 1 };
+  // One request makes all variations (n); the API returns them together.
+  const fields = { model: opts.model, prompt: opts.prompt, size, quality: opts.quality, output_format: opts.format, n: opts.count };
   if (opts.format !== "png") fields.output_compression = 90;
   if (opts.background && opts.background !== "auto") fields.background = opts.background;
 
@@ -632,13 +724,29 @@ async function openAiImage(env, opts, inputs, sizeHint) {
     const detail = json?.error?.message || json?._raw || res.statusText;
     throw new ToolError(`OpenAI returned an error (${res.status}): ${String(detail).slice(0, 600)}`);
   }
-  const item = json?.data?.[0];
-  if (!item?.b64_json) throw new ToolError("OpenAI returned no image data.");
-  return { b64: item.b64_json, mimeType: mimeFor(json.output_format || opts.format) };
+  const items = (json?.data || []).filter((d) => d?.b64_json);
+  if (!items.length) throw new ToolError("OpenAI returned no image data.");
+  const mimeType = mimeFor(json.output_format || opts.format);
+  return { images: items.map((d) => ({ b64: d.b64_json, mimeType })) };
 }
 
-/** Gemini API generateContent with image output (Nano Banana models). */
+/** Gemini API generateContent with image output (Nano Banana models). One request per variation, run in parallel. */
 async function geminiImage(env, opts, inputs) {
+  if (opts.count === 1) return { images: [await geminiOne(env, opts, inputs)] };
+  const settled = await Promise.allSettled(Array.from({ length: opts.count }, () => geminiOne(env, opts, inputs)));
+  const images = settled.filter((s) => s.status === "fulfilled").map((s) => s.value);
+  const failures = settled.filter((s) => s.status === "rejected");
+  if (!images.length) throw failures[0].reason;
+  const note = images.find((im) => im.note)?.note;
+  return {
+    images,
+    note,
+    failed: failures.length || undefined,
+    failedReason: failures.length ? String(failures[0].reason?.message || failures[0].reason).slice(0, 300) : undefined,
+  };
+}
+
+async function geminiOne(env, opts, inputs) {
   const base = (env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
   const parts = inputs.map((img) => ({
     inlineData: { mimeType: img.mimeType, data: Buffer.from(img.bytes).toString("base64") },
@@ -818,7 +926,12 @@ async function handleUpload(request, env, url) {
     if (!file) return fail(400, "No file found in the form. Use curl -T <file> <url> or curl -F file=@<file> <url>.");
     bytes = new Uint8Array(await file.arrayBuffer());
   } else {
-    bytes = new Uint8Array(await request.arrayBuffer());
+    try {
+      bytes = await readBounded(request, MAX_INPUT_BYTES);
+    } catch (err) {
+      if (err instanceof ToolError) return fail(413, tooLarge);
+      throw err;
+    }
   }
 
   if (bytes.length === 0) return fail(400, "The upload was empty.");
@@ -851,6 +964,8 @@ async function loadInputImages(env, origin, refs) {
     const ref = raw.trim();
     let bytes = null;
     let ownName = null;
+    let sourceUrl = null;
+    let sourceId = null;
 
     const bare = ref.match(/^([A-Za-z0-9_-]{16,64})(?:\.(png|jpg|jpeg|webp|gif))?$/);
     if (bare) {
@@ -871,9 +986,9 @@ async function loadInputImages(env, origin, refs) {
         if (u.protocol !== "https:" && u.protocol !== "http:") throw new ToolError(`Unsupported URL: ${ref.slice(0, 120)}`);
         const res = await fetch(u.toString(), { signal: AbortSignal.timeout(30000), headers: { accept: "image/*" } });
         if (!res.ok) throw new ToolError(`Couldn't download ${u.toString().slice(0, 120)} (HTTP ${res.status}).`);
-        const len = Number(res.headers.get("content-length") || 0);
-        if (len > MAX_INPUT_BYTES) throw new ToolError(`Image too large (max ${MAX_INPUT_BYTES / 1048576} MB).`);
-        bytes = new Uint8Array(await res.arrayBuffer());
+        // Read at most MAX_INPUT_BYTES, whatever content-length claims.
+        bytes = await readBounded(res, MAX_INPUT_BYTES);
+        sourceUrl = u.toString();
       }
     }
 
@@ -890,6 +1005,8 @@ async function loadInputImages(env, origin, refs) {
         );
       }
       bytes = new Uint8Array(await object.arrayBuffer());
+      sourceUrl = `${origin}/${object.key}`;
+      sourceId = object.key.slice("img/".length).replace(/\.[a-z]+$/, "");
     }
 
     if (!bytes || bytes.length === 0) throw new ToolError(`Empty image: ${ref.slice(0, 120)}`);
@@ -898,26 +1015,149 @@ async function loadInputImages(env, origin, refs) {
     if (!mimeType || mimeType === "image/gif") {
       throw new ToolError(`Unsupported image type for ${ref.slice(0, 120)} (use PNG, JPEG or WebP).`);
     }
-    out.push({ bytes, mimeType, dims: imageDimensions(bytes) });
+    out.push({ bytes, mimeType, dims: imageDimensions(bytes), url: sourceUrl, id: sourceId });
+  }
+  return out;
+}
+
+/** Read a response body up to maxBytes; throws a ToolError (and stops downloading) when it is larger. */
+async function readBounded(res, maxBytes) {
+  const tooLarge = new ToolError(`Image too large (max ${maxBytes / 1048576} MB).`);
+  if (Number(res.headers.get("content-length") || 0) > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooLarge;
+  }
+  if (!res.body) return new Uint8Array(await res.arrayBuffer());
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw tooLarge;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
   }
   return out;
 }
 
 // Simple daily cap so a leaked URL or a runaway loop can't run up a large bill.
-async function checkDailyLimit(env) {
+// Note: read-then-write, so calls running at the same moment can go slightly over the limit.
+async function checkDailyLimit(env, count = 1) {
   const limit = clampInt(env.DAILY_LIMIT, 0, 1_000_000, 100);
   if (limit === 0) return null;
   const key = `usage/${new Date().toISOString().slice(0, 10)}`;
   const object = await env.IMAGES.get(key);
-  const count = object ? parseInt(await object.text(), 10) || 0 : 0;
-  if (count >= limit) {
-    throw new ToolError(`Daily limit of ${limit} images reached. It resets at midnight UTC (or raise DAILY_LIMIT).`);
+  const used = object ? parseInt(await object.text(), 10) || 0 : 0;
+  if (used + count > limit) {
+    const left = Math.max(0, limit - used);
+    throw new ToolError(
+      `Daily limit of ${limit} images reached (${left} left today, ${count} requested). It resets at midnight UTC (or raise DAILY_LIMIT).`,
+    );
   }
-  return { key, count };
+  return { key, count: used };
 }
 
-async function bumpDailyCount(env, usage) {
-  if (usage) await env.IMAGES.put(usage.key, String(usage.count + 1));
+async function bumpDailyCount(env, usage, n = 1) {
+  if (usage) await env.IMAGES.put(usage.key, String(usage.count + n));
+}
+
+// ---------------------------------------------------------------------------
+// Image history (list_images) and retention
+// ---------------------------------------------------------------------------
+
+async function listImages(state, args) {
+  const { env, origin } = state;
+  if (!env.IMAGES) {
+    return { content: [{ type: "text", text: "R2 bucket binding IMAGES is missing (see wrangler.jsonc)." }], isError: true };
+  }
+  const limit = clampInt(args.limit, 1, MAX_LIST, 20);
+  const query = typeof args.query === "string" ? args.query.trim().toLowerCase() : "";
+
+  // Keys are random, so R2 can't return them by date: read the metadata of every stored image
+  // (one list call per 1000) and sort here. Fine for a personal server, and RETENTION_DAYS keeps it small.
+  const items = [];
+  let cursor;
+  let scanned = 0;
+  do {
+    const page = await env.IMAGES.list({ prefix: "img/", limit: 1000, cursor, include: ["customMetadata"] });
+    for (const o of page.objects) {
+      const m = /^img\/([A-Za-z0-9_-]{16,64})\.(png|jpg|webp|gif)$/.exec(o.key);
+      if (!m) continue;
+      const meta = o.customMetadata || {};
+      const item = {
+        id: m[1],
+        url: `${origin}/${o.key}`,
+        created: meta.created || o.uploaded.toISOString(),
+        tool: meta.tool || "unknown",
+        model: meta.model || null,
+        prompt: meta.prompt || null,
+        bytes: o.size,
+      };
+      if (query && !`${item.prompt || ""} ${item.model || ""} ${item.id}`.toLowerCase().includes(query)) continue;
+      items.push(item);
+    }
+    scanned += page.objects.length;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor && scanned < MAX_LIST_SCAN);
+
+  items.sort((a, b) => (a.created < b.created ? 1 : a.created > b.created ? -1 : 0));
+  const total = items.length;
+  const images = items.slice(0, limit);
+  const now = new Date().toISOString();
+
+  const lines = [];
+  if (!images.length) {
+    lines.push(query ? `No stored images match "${query}".` : "No images are stored on this server yet.");
+  } else {
+    lines.push(
+      `${images.length} of ${total} stored image${total === 1 ? "" : "s"}${query ? ` matching "${query}"` : ""}, newest first. Server time now: ${now}.`,
+    );
+    for (const im of images) {
+      const what = im.tool === "upload" ? "uploaded by the user" : `${im.tool} with ${im.model || "unknown model"}`;
+      const prompt = im.prompt ? ` · "${im.prompt.length > 160 ? `${im.prompt.slice(0, 160)}…` : im.prompt}"` : "";
+      lines.push(`- ${im.created.slice(0, 16).replace("T", " ")} UTC · id ${im.id} · ${what}${prompt} · ${im.url}`);
+    }
+    if (total > images.length) lines.push(`(${total - images.length} more; raise limit or narrow query to see them.)`);
+    if (scanned >= MAX_LIST_SCAN) lines.push(`(Only the first ${MAX_LIST_SCAN} stored images were searched.)`);
+  }
+  return {
+    content: [{ type: "text", text: lines.join("\n") }],
+    structuredContent: { kind: "list", now, query: query || null, total, count: images.length, images },
+  };
+}
+
+/** Delete images older than RETENTION_DAYS, plus stale daily counters. Runs from the cron trigger. */
+async function purgeOldImages(env) {
+  const days = clampInt(env.RETENTION_DAYS, 0, 3650, 0);
+  if (!env.IMAGES || days === 0) return { deleted: 0, skipped: true };
+  const cutoff = Date.now() - days * 86_400_000;
+  const usageCutoff = Date.now() - 2 * 86_400_000;
+  let deleted = 0;
+  for (const prefix of ["img/", "usage/"]) {
+    let cursor;
+    do {
+      const page = await env.IMAGES.list({ prefix, limit: 1000, cursor });
+      const limitMs = prefix === "img/" ? cutoff : usageCutoff;
+      const old = page.objects.filter((o) => o.uploaded.getTime() < limitMs).map((o) => o.key);
+      if (old.length) {
+        await env.IMAGES.delete(old);
+        deleted += old.length;
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  }
+  console.log(JSON.stringify({ event: "purge", retentionDays: days, deleted }));
+  return { deleted };
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +1196,7 @@ function statusPage(env, url) {
     `  ${mark(!!env.OPENAI_API_KEY)} OPENAI_API_KEY  ${env.OPENAI_API_KEY ? "set (GPT Image 2.5 models available)" : "not set (OpenAI models disabled)"}`,
     `  ${mark(!!env.GEMINI_API_KEY)} GEMINI_API_KEY  ${env.GEMINI_API_KEY ? "set (Nano Banana models available)" : "not set (Google models disabled)"}`,
     `  ${mark(!!env.IMAGES)} R2 bucket       ${env.IMAGES ? "connected" : "missing IMAGES binding"}`,
+    `  ${mark(true)} Retention       ${clampInt(env.RETENTION_DAYS, 0, 3650, 0) ? `images are deleted after ${clampInt(env.RETENTION_DAYS, 0, 3650, 0)} days` : "off (images are kept)"}`,
     "",
     "Your connector URL for Claude:",
     `  ${url.origin}/mcp/<your MCP_TOKEN>`,
