@@ -13,13 +13,16 @@ Claude (web / phone / desktop / Code)
 │                                 ──► Gemini  models/<id>:generateContent
 │     create_upload_link          ──► signed single-use /upload URL
 │     list_images                 ──► R2 list + customMetadata
+│     text_to_speech              ──► Gemini  /v1beta/interactions
 │  GET /img/<id>.<ext>            ──► R2 object                          │
+│  GET /audio/<id>.wav            ──► R2 object (byte ranges)            │
 │  PUT /upload/<link>             ──► R2 object                          │
 │  cron (daily)                   ──► purge objects older than RETENTION_DAYS
 └───────────────────────────────────────────────────────────────────────┘
    │
    ▼
  R2 bucket  img/<id>.<ext>  (customMetadata: tool, model, prompt | description, created)
+            audio/<id>.wav  (customMetadata: tool, model, voice, text, created)
             usage/<YYYY-MM-DD>  (daily counter)
 ```
 
@@ -103,11 +106,36 @@ R2 keys are random, so the bucket cannot be listed by date. `list_images` lists 
 entries plus the server's current time so the model can interpret "yesterday". `RETENTION_DAYS` keeps the
 bucket small enough for this to stay cheap.
 
+### text_to_speech
+
+`runSpeechTool` validates the arguments, reserves one unit of the `DAILY_LIMIT` counter shared with images,
+and calls Gemini's Interactions API. That API is separate from the `generateContent` call the image models
+use. `text` is sent as a verbatim transcript and `style` as a `speech_metadata` annotation. The request sets
+`store: false`, because Google otherwise keeps interactions (55 days on paid, 1 day on free) and a one-shot
+call never refers back to them.
+
+The response must be a RIFF/WAVE file, otherwise the call fails rather than storing something unplayable.
+Audio is stored under `audio/`, separate from `img/`, so `list_images` and the viewer don't see it, and is
+only returned as a link, because a base64 block would cost tokens and CPU.
+
+Audio stays WAV because Gemini has no MP3 output and encoding in the Worker doesn't fit the Free plan: a LAME
+WebAssembly build took about 4 ms of CPU per second of audio on a fast desktop, against a 10 ms limit per request.
+MP3 at 64 kbps would be about 83% smaller, so it is worth revisiting on Workers Paid.
+
+OpenAI's speech models were rejected because they all shut down on January 6, 2027, and the named replacement
+only works through the Realtime API, which is built for live conversation and has no documented verbatim mode.
+
+`/audio/` handles single byte ranges itself (`parseRange`) so players can seek and Safari can play the file.
+Multi-range or malformed headers get the whole file, which RFC 9110 allows.
+
+`MAX_TTS_CHARS` (5,000) is our own cap, not Google's: the guide publishes no input limit. It bounds the WAV to
+about 15 MB, since decoding base64 is the main CPU cost.
+
 ### Retention
 
-`wrangler.jsonc` declares a daily cron trigger. `scheduled()` lists `img/` and deletes objects whose
+`wrangler.jsonc` declares a daily cron trigger. `scheduled()` lists `img/` and `audio/` and deletes objects whose
 `uploaded` time is older than `RETENTION_DAYS` (0 = keep forever), and `usage/` counters older than two
-days. It uses R2's `uploaded` timestamp, not the metadata, so uploads and generated images are treated
+days. It uses R2's `uploaded` timestamp, not the metadata, so uploads, generated images and audio are treated
 alike.
 
 ## Viewer (src/viewer.js)
@@ -140,7 +168,7 @@ The HTML lives in a template literal, so it must not contain backticks or `${`.
 
 - One shared secret (`MCP_TOKEN`) in the URL or a Bearer header. Anyone holding it can generate images
   on the owner's bill; `DAILY_LIMIT` and the providers' own budgets bound the damage.
-- Image links are public but unguessable (128-bit random ids). Uploads reuse the same id space.
+- Image and audio links are public but unguessable (128-bit random ids). Uploads reuse the same id space.
 - Provider API keys stay in Worker secrets; nothing in a tool result or the viewer reveals them.
 - Remote image downloads are bounded in time (30 s) and size (20 MB), and only `http(s)` is allowed.
 - CORS is open (`*`) because the token, not the origin, is the credential, and the viewer iframe must

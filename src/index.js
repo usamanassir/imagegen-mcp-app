@@ -7,9 +7,10 @@
  *   POST /mcp/<MCP_TOKEN>   MCP endpoint (token in the URL), or
  *   POST /mcp               MCP endpoint with "Authorization: Bearer <MCP_TOKEN>"
  *   GET  /img/<id>.<ext>    Generated images (public, unguessable ids, stored in R2)
+ *   GET  /audio/<id>.wav    Speech from the text_to_speech tool (public, unguessable ids, stored in R2)
  *   PUT  /upload/<link>     Single-use upload link from the create_upload_link tool (raw body or multipart)
  *
- * A daily cron (see "triggers" in wrangler.jsonc) deletes images older than RETENTION_DAYS.
+ * A daily cron (see "triggers" in wrangler.jsonc) deletes images and audio older than RETENTION_DAYS.
  *
  * Secrets (npx wrangler secret put NAME): MCP_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY
  * Settings ("vars" in wrangler.jsonc): DEFAULT_MODEL, DEFAULT_QUALITY, DAILY_LIMIT, ...
@@ -59,6 +60,27 @@ const QUALITIES = ["low", "medium", "high", "xhigh", "max", "auto"];
 const FORMATS = ["jpeg", "png", "webp"];
 const BACKGROUNDS = ["auto", "transparent", "opaque"];
 
+// Speech models and voices for text_to_speech (Gemini only; the tool is hidden without GEMINI_API_KEY).
+const TTS_MODELS = {
+  "gemini-3.8-flash-tts": {
+    label: "Gemini 3.8 Flash TTS",
+    note: "most expressive, 130+ languages; good default",
+  },
+  "gemini-3.8-flash-lite-tts": {
+    label: "Gemini 3.8 Flash-Lite TTS",
+    note: "faster and cheaper, 100+ languages",
+  },
+};
+const DEFAULT_TTS_MODEL = "gemini-3.8-flash-tts";
+const TTS_VOICES = [
+  "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe", "Autonoe",
+  "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar",
+  "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
+];
+const DEFAULT_TTS_VOICE = "Kore";
+const MAX_TTS_CHARS = 5000; // about 5 minutes of speech, or 15 MB of WAV; keeps decoding within reach of the Workers CPU limit
+const MAX_TTS_STYLE_CHARS = 500;
+
 const MAX_PROMPT_CHARS = 32000;
 const MAX_INPUT_IMAGES = 8;
 const MAX_INPUT_BYTES = 20 * 1024 * 1024;
@@ -78,6 +100,7 @@ const INSTRUCTIONS = [
   "call create_upload_link, upload the file with the curl command it returns from your code execution environment,",
   "then call edit_image with the returned image id.",
   "Use list_images to find images from earlier conversations (e.g. 'the logo from yesterday') by date or prompt text.",
+  "Use text_to_speech when the user wants text read aloud as an audio file; it is read word for word, so put delivery directions in style, not in text.",
   "Write rich prompts: subject, setting, style or medium, composition, lighting, colors, mood; put any text that must appear in the image in quotes.",
   "After each call, give the user the image link from the result so they can open or download it.",
 ].join(" ");
@@ -93,6 +116,7 @@ export default {
       if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
 
       if (url.pathname.startsWith("/img/")) return await serveImage(request, env, url);
+      if (url.pathname.startsWith("/audio/")) return await serveAudio(request, env, url);
       if (url.pathname.startsWith("/upload/")) return await handleUpload(request, env, url);
 
       if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
@@ -107,7 +131,7 @@ export default {
     }
   },
 
-  // Cron trigger: delete images older than RETENTION_DAYS (0 or unset keeps everything).
+  // Cron trigger: delete images and audio older than RETENTION_DAYS (0 or unset keeps everything).
   async scheduled(event, env, ctx) {
     ctx.waitUntil(purgeOldImages(env));
   },
@@ -232,6 +256,7 @@ function streamToolCall(msg, state) {
   const encoder = new TextEncoder();
   const progressToken = msg.params?._meta?.progressToken;
   const interval = clampInt(state.env.KEEPALIVE_MS, 1000, 60000, 10000);
+  const working = msg.params?.name === "text_to_speech" ? "Generating audio" : "Generating image";
 
   const run = (async () => {
     let ticks = 0;
@@ -242,7 +267,7 @@ function streamToolCall(msg, state) {
         const note = {
           jsonrpc: "2.0",
           method: "notifications/progress",
-          params: { progressToken, progress: ticks, message: `Generating image (${Math.round((ticks * interval) / 1000)} s)…` },
+          params: { progressToken, progress: ticks, message: `${working} (${Math.round((ticks * interval) / 1000)} s)…` },
         };
         chunk += `event: message\ndata: ${JSON.stringify(note)}\n\n`;
       }
@@ -313,6 +338,7 @@ async function handleRequest(method, params, state) {
       const name = params.name;
       if (name === "create_upload_link") return { result: await createUploadLink(state, params.arguments || {}) };
       if (name === "list_images") return { result: await listImages(state, params.arguments || {}) };
+      if (name === "text_to_speech") return { result: await runSpeechTool(params.arguments || {}, state) };
       if (name !== "generate_image" && name !== "edit_image") {
         throw new RpcError(-32602, `Unknown tool: ${name}`);
       }
@@ -553,7 +579,52 @@ function toolDefinitions(env, ui) {
       annotations: { title: "List images", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       ...meta,
     },
+    ...(env.GEMINI_API_KEY ? [speechToolDefinition(annotations)] : []),
   ];
+}
+
+function speechToolDefinition(annotations) {
+  const modelHelp = Object.entries(TTS_MODELS)
+    .map(([id, m]) => `${id}: ${m.label} (${m.note})`)
+    .join("; ");
+  return {
+    name: "text_to_speech",
+    title: "Text to speech",
+    description:
+      "Turn text into a spoken audio file (WAV). The text is read word for word, so leave out anything that shouldn't be spoken; " +
+      "the language is detected automatically. Returns a public link to the audio (always share it with the user).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          maxLength: MAX_TTS_CHARS,
+          description:
+            "The exact words to speak. May contain inline tags such as <short pause>, <long pause>, <laugh> or <sigh>, and capitalized words for emphasis.",
+        },
+        voice: {
+          type: "string",
+          enum: TTS_VOICES,
+          default: DEFAULT_TTS_VOICE,
+          description: "The voice to speak with.",
+        },
+        style: {
+          type: "string",
+          maxLength: MAX_TTS_STYLE_CHARS,
+          description: "Optional. How to deliver the whole text, e.g. 'cheerful and friendly' or 'slow, calm whisper'. Not spoken.",
+        },
+        model: {
+          type: "string",
+          enum: Object.keys(TTS_MODELS),
+          default: DEFAULT_TTS_MODEL,
+          description: `Speech model. ${modelHelp}.`,
+        },
+      },
+      required: ["text"],
+      additionalProperties: false,
+    },
+    annotations: { title: "Text to speech", ...annotations },
+  };
 }
 
 function normalizeArgs(tool, args, env) {
@@ -754,9 +825,103 @@ async function runImageTool(tool, args, state) {
   }
 }
 
+function normalizeSpeechArgs(args) {
+  const text = typeof args.text === "string" ? args.text.trim() : "";
+  if (!text) throw new ToolError("'text' must be a non-empty string.");
+  if (text.length > MAX_TTS_CHARS) {
+    throw new ToolError(`'text' is too long (${text.length} characters, max ${MAX_TTS_CHARS}). Split it into several calls.`);
+  }
+  const style = typeof args.style === "string" ? args.style.trim() : "";
+  if (style.length > MAX_TTS_STYLE_CHARS) throw new ToolError(`'style' is too long (max ${MAX_TTS_STYLE_CHARS} characters).`);
+  const model = args.model ?? DEFAULT_TTS_MODEL;
+  if (!Object.hasOwn(TTS_MODELS, model)) {
+    throw new ToolError(`Unknown speech model '${model}'. Available: ${Object.keys(TTS_MODELS).join(", ")}.`);
+  }
+  const voice = args.voice ?? DEFAULT_TTS_VOICE;
+  if (!TTS_VOICES.includes(voice)) throw new ToolError(`Unknown voice '${voice}'. Available: ${TTS_VOICES.join(", ")}.`);
+  return { text, style, model, voice };
+}
+
+async function runSpeechTool(args, state) {
+  const { env, origin } = state;
+  try {
+    const opts = normalizeSpeechArgs(args);
+    if (!env.GEMINI_API_KEY) throw new ToolError("GEMINI_API_KEY is not set on the server, so text_to_speech can't be used.");
+    if (!env.IMAGES) throw new ToolError("R2 bucket binding IMAGES is missing (see wrangler.jsonc).");
+
+    const usage = await checkDailyLimit(env, 1, "images and audio clips");
+    const started = Date.now();
+    const bytes = await geminiSpeech(env, opts);
+    const wav = wavInfo(bytes);
+    if (!wav) throw new ToolError("Google returned audio in an unexpected format (expected WAV).");
+
+    const meta = { tool: "text_to_speech", model: opts.model, voice: opts.voice, text: truncateUtf8(opts.text, 600), created: new Date().toISOString() };
+    const { id, url } = await storeAudio(env, origin, bytes, meta);
+    await bumpDailyCount(env, usage, 1);
+    console.log(JSON.stringify({ event: "speech", model: opts.model, voice: opts.voice, chars: opts.text.length, ms: Date.now() - started, bytes: bytes.length }));
+
+    const lines = [
+      `Audio ready: ${url}`,
+      `Audio id: ${id} · ${formatDuration(wav.seconds)} · audio/wav · ${(bytes.length / 1048576).toFixed(1)} MB`,
+      `Model: ${TTS_MODELS[opts.model].label} · Voice: ${opts.voice}`,
+      "Share the link with the user so they can play or download the audio.",
+    ];
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+      structuredContent: {
+        url,
+        id,
+        model: opts.model,
+        modelLabel: TTS_MODELS[opts.model].label,
+        voice: opts.voice,
+        mimeType: "audio/wav",
+        bytes: bytes.length,
+        seconds: wav.seconds,
+      },
+    };
+  } catch (err) {
+    const message = err instanceof ToolError ? err.message : `Speech generation failed: ${err?.message || String(err)}`;
+    if (!(err instanceof ToolError)) console.error("tool error", err?.stack || err);
+    return { content: [{ type: "text", text: message }], isError: true };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Providers
 // ---------------------------------------------------------------------------
+
+/**
+ * Gemini Interactions API with audio output; returns the WAV bytes. The text is read verbatim and
+ * style only directs the delivery. store: false, because Google otherwise keeps the interaction
+ * (up to 55 days) and a one-shot call never refers back to it.
+ */
+async function geminiSpeech(env, opts) {
+  const base = (env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
+  const content = { type: "text", text: opts.text };
+  if (opts.style) content.annotations = [{ type: "speech_metadata", style: opts.style }];
+
+  const res = await fetch(`${base}/v1beta/interactions`, {
+    method: "POST",
+    headers: { "x-goog-api-key": env.GEMINI_API_KEY, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: opts.model,
+      input: [{ type: "user_input", content: [content] }],
+      response_format: { type: "audio" },
+      generation_config: { speech_config: [{ voice: opts.voice }] },
+      store: false,
+    }),
+    signal: AbortSignal.timeout(clampInt(env.PROVIDER_TIMEOUT_MS, 10000, 600000, 300000)),
+  });
+  const json = await readJson(res);
+  if (!res.ok) {
+    const detail = json?.error?.message || json?._raw || res.statusText;
+    throw new ToolError(`Google returned an error (${res.status}): ${String(detail).slice(0, 600)}`);
+  }
+  const blocks = (json?.steps || []).filter((s) => s?.type === "model_output").flatMap((s) => s.content || []);
+  const audio = blocks.filter((c) => c?.type === "audio" && c.data).pop();
+  if (!audio) throw new ToolError("Google returned no audio.");
+  return Buffer.from(audio.data, "base64");
+}
 
 /** OpenAI Image API: /v1/images/generations, or /v1/images/edits when input images are given. */
 async function openAiImage(env, opts, inputs, sizeHint) {
@@ -926,6 +1091,78 @@ async function serveImage(request, env, url) {
     `${url.searchParams.has("download") ? "attachment" : "inline"}; filename="imagegen-${name}"`,
   );
   return new Response(request.method === "HEAD" ? null : object.body, { headers });
+}
+
+async function storeAudio(env, origin, bytes, meta) {
+  const id = randomId();
+  await env.IMAGES.put(`audio/${id}.wav`, bytes, {
+    httpMetadata: { contentType: "audio/wav", cacheControl: "public, max-age=31536000, immutable" },
+    customMetadata: meta,
+  });
+  return { id, url: `${origin}/audio/${id}.wav` };
+}
+
+/** Serve stored speech. Supports byte ranges, which players use to seek and which Safari asks for before playing. */
+async function serveAudio(request, env, url) {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return new Response("Method not allowed\n", { status: 405, headers: { allow: "GET, HEAD" } });
+  }
+  const name = url.pathname.slice("/audio/".length);
+  if (!/^[A-Za-z0-9_-]{16,64}\.wav$/.test(name) || !env.IMAGES) {
+    return new Response("Not found\n", { status: 404 });
+  }
+  const key = `audio/${name}`;
+  const info = await env.IMAGES.head(key);
+  if (!info) return new Response("Not found\n", { status: 404 });
+
+  const headers = new Headers();
+  info.writeHttpMetadata(headers);
+  headers.set("etag", info.httpEtag);
+  headers.set("accept-ranges", "bytes");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("access-control-allow-origin", "*");
+  headers.set(
+    "content-disposition",
+    `${url.searchParams.has("download") ? "attachment" : "inline"}; filename="speech-${name}"`,
+  );
+
+  const range = parseRange(request.headers.get("range"), info.size);
+  if (range === "unsatisfiable") {
+    headers.set("content-range", `bytes */${info.size}`);
+    return new Response(null, { status: 416, headers });
+  }
+  if (range) {
+    headers.set("content-range", `bytes ${range.offset}-${range.offset + range.length - 1}/${info.size}`);
+    headers.set("content-length", String(range.length));
+  } else {
+    headers.set("content-length", String(info.size));
+  }
+  const status = range ? 206 : 200;
+  if (request.method === "HEAD") return new Response(null, { status, headers });
+
+  const object = await env.IMAGES.get(key, range ? { range } : undefined);
+  if (!object) return new Response("Not found\n", { status: 404 });
+  return new Response(object.body, { status, headers });
+}
+
+/**
+ * Parse a single-range "Range: bytes=..." header. Returns { offset, length }, "unsatisfiable", or
+ * null to serve the whole file (no header, or a form we don't support, as RFC 9110 allows).
+ */
+export function parseRange(header, size) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec((header || "").trim());
+  if (!m || (m[1] === "" && m[2] === "")) return null;
+  if (m[1] === "") {
+    const suffix = Number(m[2]);
+    if (suffix === 0 || size === 0) return "unsatisfiable";
+    const length = Math.min(suffix, size);
+    return { offset: size - length, length };
+  }
+  const offset = Number(m[1]);
+  if (offset >= size) return "unsatisfiable";
+  const end = m[2] === "" ? size - 1 : Math.min(Number(m[2]), size - 1);
+  if (end < offset) return null;
+  return { offset, length: end - offset + 1 };
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,7 +1376,7 @@ async function readBounded(res, maxBytes) {
 
 // Simple daily cap so a leaked URL or a runaway loop can't run up a large bill.
 // Note: read-then-write, so calls running at the same moment can go slightly over the limit.
-async function checkDailyLimit(env, count = 1) {
+async function checkDailyLimit(env, count = 1, unit = "images") {
   const limit = clampInt(env.DAILY_LIMIT, 0, 1_000_000, 100);
   if (limit === 0) return null;
   const key = `usage/${new Date().toISOString().slice(0, 10)}`;
@@ -1148,7 +1385,7 @@ async function checkDailyLimit(env, count = 1) {
   if (used + count > limit) {
     const left = Math.max(0, limit - used);
     throw new ToolError(
-      `Daily limit of ${limit} images reached (${left} left today, ${count} requested). It resets at midnight UTC (or raise DAILY_LIMIT).`,
+      `Daily limit of ${limit} ${unit} reached (${left} left today, ${count} requested). It resets at midnight UTC (or raise DAILY_LIMIT).`,
     );
   }
   return { key, count: used };
@@ -1225,18 +1462,18 @@ async function listImages(state, args) {
   };
 }
 
-/** Delete images older than RETENTION_DAYS, plus stale daily counters. Runs from the cron trigger. */
+/** Delete images and audio older than RETENTION_DAYS, plus stale daily counters. Runs from the cron trigger. */
 async function purgeOldImages(env) {
   const days = clampInt(env.RETENTION_DAYS, 0, 3650, 0);
   if (!env.IMAGES || days === 0) return { deleted: 0, skipped: true };
   const cutoff = Date.now() - days * 86_400_000;
   const usageCutoff = Date.now() - 2 * 86_400_000;
   let deleted = 0;
-  for (const prefix of ["img/", "usage/"]) {
+  for (const prefix of ["img/", "audio/", "usage/"]) {
     let cursor;
     do {
       const page = await env.IMAGES.list({ prefix, limit: 1000, cursor });
-      const limitMs = prefix === "img/" ? cutoff : usageCutoff;
+      const limitMs = prefix === "usage/" ? usageCutoff : cutoff;
       const old = page.objects.filter((o) => o.uploaded.getTime() < limitMs).map((o) => o.key);
       if (old.length) {
         await env.IMAGES.delete(old);
@@ -1283,7 +1520,7 @@ function statusPage(env, url) {
     "Setup check",
     `  ${mark(!problem)} MCP_TOKEN       ${problem ? problem : "set"}`,
     `  ${mark(!!env.OPENAI_API_KEY)} OPENAI_API_KEY  ${env.OPENAI_API_KEY ? "set (GPT Image 2.5 models available)" : "not set (OpenAI models disabled)"}`,
-    `  ${mark(!!env.GEMINI_API_KEY)} GEMINI_API_KEY  ${env.GEMINI_API_KEY ? "set (Nano Banana models available)" : "not set (Google models disabled)"}`,
+    `  ${mark(!!env.GEMINI_API_KEY)} GEMINI_API_KEY  ${env.GEMINI_API_KEY ? "set (Nano Banana models and text to speech available)" : "not set (Google models and text to speech disabled)"}`,
     `  ${mark(!!env.IMAGES)} R2 bucket       ${env.IMAGES ? "connected" : "missing IMAGES binding"}`,
     `  ${mark(true)} Retention       ${clampInt(env.RETENTION_DAYS, 0, 3650, 0) ? `images are deleted after ${clampInt(env.RETENTION_DAYS, 0, 3650, 0)} days` : "off (images are kept)"}`,
     "",
@@ -1436,6 +1673,19 @@ export function sniffMime(b) {
   if (b.length >= 12 && ascii(b, 0, 4) === "RIFF" && ascii(b, 8, 12) === "WEBP") return "image/webp";
   if (b.length >= 6 && ascii(b, 0, 3) === "GIF") return "image/gif";
   return null;
+}
+
+/** Check for a RIFF/WAVE header and work out the length from the byte rate in its fmt chunk. */
+export function wavInfo(b) {
+  if (b.length < 44 || ascii(b, 0, 4) !== "RIFF" || ascii(b, 8, 12) !== "WAVE" || ascii(b, 12, 16) !== "fmt ") return null;
+  const byteRate = new DataView(b.buffer, b.byteOffset, b.byteLength).getUint32(28, true);
+  return { seconds: byteRate ? Math.round(((b.length - 44) / byteRate) * 10) / 10 : null };
+}
+
+function formatDuration(seconds) {
+  if (seconds === null) return "unknown length";
+  const s = Math.round(seconds);
+  return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`;
 }
 
 /** Read width/height from PNG, JPEG or WebP headers. */

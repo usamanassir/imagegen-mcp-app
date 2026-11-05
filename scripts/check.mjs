@@ -6,17 +6,19 @@
 //   node scripts/check.mjs "<connector URL>" --generate "a cat, watercolor" --generate "a cat, pencil sketch"   (several prompts)
 //   node scripts/check.mjs "<connector URL>" --upload photo.jpg [--describe "old family photo"]
 //   node scripts/check.mjs "<connector URL>" --list [--query logo]
+//   node scripts/check.mjs "<connector URL>" --speak "Hello there" [--voice Puck] [--style "cheerful"] [--model gemini-3.8-flash-lite-tts]
 //
 // The second form makes real images (billed by OpenAI/Google) and prints their links.
 // The third uploads a local image through create_upload_link (free) and prints its id.
 // The fourth lists stored images, newest first.
+// The fifth makes real speech (billed by Google unless the key is on the free tier) and prints its link.
 
 import { readFile } from "node:fs/promises";
 
 const [url, ...rest] = process.argv.slice(2);
 if (!url || !/^https?:\/\//.test(url)) {
   console.error(
-    'Usage: node scripts/check.mjs "<connector URL>" [--generate "<prompt>"] [--model <model>] [--count <n>] [--upload <file>] [--list] [--query <text>]',
+    'Usage: node scripts/check.mjs "<connector URL>" [--generate "<prompt>"] [--model <model>] [--count <n>] [--upload <file>] [--list] [--query <text>] [--speak "<text>"] [--voice <voice>] [--style <style>]',
   );
   process.exit(2);
 }
@@ -91,8 +93,21 @@ try {
       process.exit(1);
     }
     console.log(`✔ Done in ${Math.round((Date.now() - started) / 1000)} s\n${text}`);
-  } else if (!uploadFile && !rest.includes("--list")) {
+  } else if (!uploadFile && !rest.includes("--list") && !flag("--speak")) {
     console.log("All good. Add --generate \"<prompt>\" to make a test image.");
+  }
+  if (flag("--speak")) {
+    const args = { text: flag("--speak") };
+    for (const name of ["voice", "style", "model"]) if (flag(`--${name}`)) args[name] = flag(`--${name}`);
+    console.log("… generating speech");
+    const started = Date.now();
+    const result = await rpc("tools/call", { name: "text_to_speech", arguments: args });
+    const text = result.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+    if (result.isError) {
+      console.error(`✘ Speech failed: ${text}`);
+      process.exit(1);
+    }
+    console.log(`✔ Done in ${Math.round((Date.now() - started) / 1000)} s\n${text}`);
   }
   if (rest.includes("--list")) {
     const args = {};

@@ -106,8 +106,8 @@ describe("retention (scheduled)", () => {
     { key: "usage/2026-10-01", uploaded: new Date(now - 10 * day) },
     { key: "usage/today", uploaded: new Date(now) },
   ];
-  const purge = async (vars) => {
-    const { bucket, deleted } = fakeBucket(objects);
+  const purge = async (vars, list = objects) => {
+    const { bucket, deleted } = fakeBucket(list);
     const ctx = createExecutionContext();
     await worker.scheduled({ cron: "23 3 * * *", scheduledTime: now }, { ...env, IMAGES: bucket, ...vars }, ctx);
     await waitOnExecutionContext(ctx);
@@ -117,6 +117,14 @@ describe("retention (scheduled)", () => {
   it("deletes images older than RETENTION_DAYS and stale usage counters", async () => {
     expect(await purge({ RETENTION_DAYS: "14" })).toEqual(["img/old15.jpg", "img/old45.png", "usage/2026-10-01"]);
     expect(await purge({ RETENTION_DAYS: "1" })).toEqual(["img/edge.png", "img/old15.jpg", "img/old45.png", "usage/2026-10-01"]);
+  });
+
+  it("deletes audio older than RETENTION_DAYS", async () => {
+    const audio = [
+      { key: "audio/old.wav", uploaded: new Date(now - 15 * day) },
+      { key: "audio/new.wav", uploaded: new Date(now - 3 * day) },
+    ];
+    expect(await purge({ RETENTION_DAYS: "14" }, audio)).toEqual(["audio/old.wav"]);
   });
 
   it("deletes nothing when retention is 0, unset or invalid", async () => {

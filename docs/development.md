@@ -33,8 +33,8 @@ npm run test:watch    # re-run on change
 
 The suite runs inside the Workers runtime with an in-memory R2 bucket. All outbound requests from the
 Worker go to `test/mock-providers.js`, so tests need no network and no keys. Prompts containing `fail-me`
-make the fake provider fail; `blocked` makes Gemini return no image; `https://images.test/…` serves test
-images, including a 25 MB stream with a lying `content-length`.
+make the fake provider fail; `blocked` makes Gemini return no image; `no-audio` and `not-wav` do the same for
+speech; `https://images.test/…` serves test images, including a 25 MB stream with a lying `content-length`.
 
 Conventions:
 
@@ -43,6 +43,7 @@ Conventions:
 - `call(tool, args, { env })` is a `tools/call` shortcut returning the tool result.
 - `beforeEach(clearBucket)` where tests depend on bucket contents; storage is shared within a file.
 - `providerCalls()` returns and resets how many requests each fake provider received.
+- `GET https://mock.test/__speech` returns the last speech request, to check what was sent to Google.
 - Streaming responses: read the body before `waitOnExecutionContext`, or the writer blocks.
 
 What is not covered: the viewer's browser behaviour. It was checked by hand with Playwright against a

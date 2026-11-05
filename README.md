@@ -8,6 +8,7 @@ A small remote MCP server on **Cloudflare Workers** that gives Claude these tool
 - **`edit_image`**: changes earlier images or combines several reference images.
 - **`create_upload_link`**: lets Claude upload an image you attached in the chat so it can edit or restore it.
 - **`list_images`**: finds earlier images by date or prompt, so you can say "edit the logo from yesterday".
+- **`text_to_speech`**: reads text aloud and gives you a link to the audio file (needs a Gemini API key).
 
 It works with **OpenAI GPT Image 2.5** (Flare, Sunburst) and **Google Nano Banana** (2.1 and 2). Images are saved
 in Cloudflare R2, and each one gets its own link. Claude also gets a copy of the image so it can look
@@ -24,7 +25,7 @@ Desktop.
 |---|---|
 | Cloudflare account (free) | Workers free plan is enough to start. R2 asks for a card or PayPal once to activate, but the free tier (10 GB) costs nothing. |
 | OpenAI API key | For the GPT Image 2.5 models. It's billed per image, separately from ChatGPT Plus. OpenAI may ask you to verify your organization before GPT Image models work. |
-| Gemini API key | For the Nano Banana models (from Google AI Studio). Optional: you can use just one provider. |
+| Gemini API key | For the Nano Banana models and text to speech (from Google AI Studio). Optional: you can use just one provider, but text to speech needs this key. |
 | A GitHub account | Only for the Deploy button (option A). |
 | A computer with Node.js 18+ | Only if you deploy from the command line (option B). |
 
@@ -172,6 +173,20 @@ A model only appears if its provider's key is set. Claude picks the options from
 To add another model from the same providers, add a line to `MODELS` at the top of `src/index.js` and run
 `npm run deploy`.
 
+### Text to speech
+
+Ask for example "Read this aloud in a calm voice: …". Claude calls `text_to_speech`, and you get a link to a WAV file
+you can play or download.
+
+- `text`: the exact words to speak, up to 5,000 characters (about 5 minutes). It can contain tags such as
+  `<short pause>` or `<laugh>`. The language is detected automatically.
+- `voice`: one of 30 voices, such as `Kore` (default), `Puck` or `Charon`.
+- `style`: how to deliver it, such as "cheerful and friendly". This isn't spoken.
+- `model`: `gemini-3.8-flash-tts` (default) or the cheaper `gemini-3.8-flash-lite-tts`, which covers fewer languages.
+
+WAV files are about 2.9 MB per minute. To test it from a computer:
+`node scripts/check.mjs "<connector URL>" --speak "Hello there"`
+
 ## Settings
 
 Change these in `wrangler.jsonc` → `vars`, then run `npm run deploy`:
@@ -180,8 +195,8 @@ Change these in `wrangler.jsonc` → `vars`, then run `npm run deploy`:
 |---|---|---|
 | `DEFAULT_MODEL` | `gpt-image-2.5-flare` | The model used when you don't name one |
 | `DEFAULT_QUALITY` | `auto` | The default OpenAI quality (`medium` if the value is unset or invalid) |
-| `DAILY_LIMIT` | `100` | The most images per day (UTC); `0` turns the limit off |
-| `RETENTION_DAYS` | `14` | Images older than this are deleted by a daily job (03:23 UTC); `0` keeps them forever |
+| `DAILY_LIMIT` | `100` | The most images and audio clips per day (UTC); `0` turns the limit off |
+| `RETENTION_DAYS` | `14` | Images and audio older than this are deleted by a daily job (03:23 UTC); `0` keeps them forever |
 | `PREVIEW_MAX_BYTES` | `1500000` | Total size of the image copies sent to Claude per call; bigger results are sent as links only |
 | `PREVIEW_TO_CLAUDE` | `true` | `false` means Claude never gets a copy of the image, which saves tokens |
 | `ALLOWED_ORIGINS` | — | Extra browser origins allowed to call `/mcp` (claude.ai and localhost are always allowed) |
@@ -190,6 +205,10 @@ Change these in `wrangler.jsonc` → `vars`, then run `npm run deploy`:
 
 - **OpenAI and Google** charge per image. The cost goes up with resolution and quality. Set a monthly budget in
   each provider's billing settings; `DAILY_LIMIT` is a second safety net.
+- **Text to speech** is billed by Google per token. Gemini 3.8 Flash TTS is about $0.0135 per minute of speech through
+  December 31, 2026 and about $0.027 after that; Flash-Lite is about $0.009, then $0.018. A key from a Google project
+  with no billing uses the free tier: it costs nothing and has lower limits, but Google may use what you send to
+  improve its products, so use a paid key for private text.
 - **Cloudflare Workers Free** allows 100,000 requests a day and **10 ms of CPU per request**. Waiting for OpenAI or
   Google doesn't count toward that, and 1K images fit easily. Large 2K/4K outputs, especially Nano Banana PNGs, can
   go over it. If a call fails with *"Worker exceeded CPU time limit"* (error 1102), switch to **Workers Paid**
@@ -204,7 +223,7 @@ Change these in `wrangler.jsonc` → `vars`, then run `npm run deploy`:
 - Anyone with your connector URL can make images on your bill. Keep it private. To change the token, edit it in the
   dashboard (**Settings → Variables and Secrets**) or run `npx wrangler secret put MCP_TOKEN`, then remove the
   connector and add it back with the new URL.
-- Image links aren't password-protected, but they contain a random 128-bit id, so nobody can guess them.
+- Image and audio links aren't password-protected, but they contain a random 128-bit id, so nobody can guess them.
 - API keys stay in Cloudflare secrets. Claude, the browser and the phone never see them.
 
 ## Troubleshooting

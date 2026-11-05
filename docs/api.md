@@ -7,6 +7,7 @@
 | `POST` | `/mcp/<MCP_TOKEN>` | token in path | MCP endpoint (JSON-RPC 2.0, Streamable HTTP) |
 | `POST` | `/mcp` | `Authorization: Bearer <MCP_TOKEN>` | Same, for clients that can set headers |
 | `GET`, `HEAD` | `/img/<id>.<png\|jpg\|webp\|gif>` | none | Serve a stored image. `?download=1` sets `Content-Disposition: attachment` |
+| `GET`, `HEAD` | `/audio/<id>.wav` | none | Serve stored speech. Supports single byte ranges (`206`, `416`). `?download=1` sets `Content-Disposition: attachment` |
 | `PUT`, `POST` | `/upload/<id>.<expires>.<sig>[?d=…]` | signed link | Store one image for a link made by `create_upload_link` |
 | `GET` | `/` | none | Plain-text setup check (never prints secret values) |
 | `OPTIONS` | any | none | CORS preflight (204) |
@@ -123,6 +124,29 @@ Arguments: `query` (optional, case-insensitive substring over prompt, descriptio
 
 The text block lists one line per image: `YYYY-MM-DD HH:MM UTC · id … · <tool> with <model> · "<prompt>" · <url>`.
 
+### `text_to_speech`
+
+Only listed when `GEMINI_API_KEY` is set.
+
+| Argument | Values | Default | Notes |
+|---|---|---|---|
+| `text` | string, 1–5,000 characters | required | Read verbatim. May contain inline tags such as `<short pause>` |
+| `voice` | one of 30 prebuilt voices | `Kore` | |
+| `style` | string, ≤ 500 characters | — | Delivery direction for the whole text; not spoken |
+| `model` | `gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts` | `gemini-3.8-flash-tts` | |
+
+`content`: one text block with the link, id, length and size. Audio is not attached as a content block.
+
+`structuredContent`:
+
+```jsonc
+{
+  "url": "https://…/audio/<id>.wav", "id": "<id>", "model": "gemini-3.8-flash-tts",
+  "modelLabel": "Gemini 3.8 Flash TTS", "voice": "Kore", "mimeType": "audio/wav",
+  "bytes": 48044, "seconds": 1      // seconds is null if the WAV header has no byte rate
+}
+```
+
 ## Resources
 
 | URI | MIME type | Content |
@@ -143,7 +167,7 @@ Vars (`wrangler.jsonc` → `vars`):
 |---|---|---|
 | `DEFAULT_MODEL` | `gpt-image-2.5-flare` | any available model id |
 | `DEFAULT_QUALITY` | `auto` | quality enum; invalid → `medium` |
-| `DAILY_LIMIT` | `100` | 0 (off) – 1,000,000 images per UTC day |
+| `DAILY_LIMIT` | `100` | 0 (off) – 1,000,000 images and audio clips per UTC day |
 | `RETENTION_DAYS` | `14` | 0 (keep) – 3650 |
 | `PREVIEW_MAX_BYTES` | `1500000` | 0 – 4,500,000 total preview bytes per call |
 | `PREVIEW_TO_CLAUDE` | `true` | `false` sends links only |

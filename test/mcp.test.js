@@ -174,12 +174,13 @@ describe("protocol handling", () => {
 });
 
 describe("tools/list", () => {
-  it("lists four tools with model enums limited to configured providers", async () => {
+  it("lists five tools with model enums limited to configured providers", async () => {
     const all = (await rpc("tools/list")).result.tools;
-    expect(all.map((t) => t.name)).toEqual(["generate_image", "edit_image", "create_upload_link", "list_images"]);
+    expect(all.map((t) => t.name)).toEqual(["generate_image", "edit_image", "create_upload_link", "list_images", "text_to_speech"]);
     expect(all[0].inputSchema.properties.model.enum).toHaveLength(4);
 
     const openaiOnly = (await rpc("tools/list", {}, { env: { GEMINI_API_KEY: "" } })).result.tools;
+    expect(openaiOnly.map((t) => t.name)).not.toContain("text_to_speech");
     expect(openaiOnly[0].inputSchema.properties.model.enum).toEqual(["gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]);
     expect(openaiOnly[1].description).toContain("prefer gpt-image-2.5-sunburst and");
     expect(openaiOnly[1].description).not.toContain("nano-banana");
