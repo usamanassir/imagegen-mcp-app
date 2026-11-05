@@ -2,10 +2,11 @@
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/usamanassir/imagegen-mcp)
 
-A small remote MCP server on **Cloudflare Workers** that gives Claude two tools:
+A small remote MCP server on **Cloudflare Workers** that gives Claude these tools:
 
 - **`generate_image`**: creates a new image from a description.
 - **`edit_image`**: changes earlier images or combines several reference images.
+- **`create_upload_link`**: lets Claude upload an image you attached in the chat so it can edit or restore it.
 
 It works with **OpenAI GPT Image 2.5** (Flare, Sunburst) and **Google Nano Banana** (2.1 and 2). Images are saved
 in Cloudflare R2, and each one gets its own link. Claude also gets a copy of the image so it can look
@@ -104,6 +105,27 @@ Then just ask, for example:
 - "Now make it night time and keep everything else the same." (Claude calls `edit_image` on the last image.)
 - "Do the same prompt with Nano Banana so I can compare."
 
+### Editing images you attach in the chat
+
+Claude can't pass a chat attachment straight to an MCP tool, so it uploads the file with code instead. Attach a
+photo and ask, for example, "Restore this old photo: remove the scratches and fix the faded colors." Claude then:
+
+1. calls `create_upload_link`, which returns a single-use upload link that expires after 10 minutes,
+2. uploads the file from its code sandbox with `curl`,
+3. calls `edit_image` with the new image id.
+
+For this to work on claude.ai (web and phone):
+
+- Turn on **Settings → Capabilities → Code execution and file creation**.
+- Add your Worker's domain (`imagegen-mcp-app.<your-subdomain>.workers.dev`) to the **allowed domains** for code
+  execution. Without it the sandbox can't reach the Worker.
+
+Claude Code needs no setup, since it runs `curl` on your own machine. The upload link never contains your
+`MCP_TOKEN`; it is signed with it, so changing the token cancels all open links. Uploads don't count toward
+`DAILY_LIMIT`, because they cost nothing at OpenAI or Google.
+
+To test the upload from a computer: `node scripts/check.mjs "<connector URL>" --upload photo.jpg`
+
 **If you'd rather not put the token in the URL**, use `https://…workers.dev/mcp` as the URL and add the request
 header `Authorization: Bearer <MCP_TOKEN>` in the connector's settings.
 
@@ -176,6 +198,8 @@ Change these in `wrangler.jsonc` → `vars`, then run `npm run deploy`:
 - `POST /mcp/<token>` is the MCP endpoint. It uses Streamable HTTP and is stateless. It supports protocol versions
   2024-11-05 through 2025-11-25. Tool calls stream SSE keep-alives and progress while the image is being made.
 - `GET /img/<id>.<ext>` serves the images from R2. Add `?download=1` to download a file.
+- `PUT /upload/<link>` accepts one image (raw body or multipart form) for a link made by `create_upload_link`. The
+  link is `<id>.<expiry>.<HMAC signature>`, so the server keeps no state for it; it is spent once the image exists.
 - `ui://imagegen/viewer.html` is a small MCP App (spec 2026-01-26) that shows the image in the chat.
 - OpenAI is called through `/v1/images/generations` and `/v1/images/edits`. Google is called through
   `models/<id>:generateContent` with image output. The code is all in `src/index.js` and `src/viewer.js` and has no

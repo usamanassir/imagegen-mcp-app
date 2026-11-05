@@ -7,6 +7,7 @@
  *   POST /mcp/<MCP_TOKEN>   MCP endpoint (token in the URL), or
  *   POST /mcp               MCP endpoint with "Authorization: Bearer <MCP_TOKEN>"
  *   GET  /img/<id>.<ext>    Generated images (public, unguessable ids, stored in R2)
+ *   PUT  /upload/<link>     Single-use upload link from the create_upload_link tool (raw body or multipart)
  *
  * Secrets (npx wrangler secret put NAME): MCP_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY
  * Settings ("vars" in wrangler.jsonc): DEFAULT_MODEL, DEFAULT_QUALITY, DAILY_LIMIT, ...
@@ -60,11 +61,15 @@ const MAX_PROMPT_CHARS = 32000;
 const MAX_INPUT_IMAGES = 8;
 const MAX_INPUT_BYTES = 20 * 1024 * 1024;
 const DEFAULT_PREVIEW_MAX_BYTES = 1_500_000; // larger images are linked only (keeps CPU low on the Workers Free plan)
+const UPLOAD_LINK_TTL_MS = 10 * 60 * 1000;
 
 const INSTRUCTIONS = [
   "Image generation tools.",
   "Use generate_image when the user wants a new picture (photo, illustration, logo, poster, icon, mockup art).",
   "Use edit_image to change or remix an image: pass the URL of an image returned earlier (or a public image URL).",
+  "If the user attached an image in the chat (e.g. to restore, fix or edit it), you can't pass the attachment directly:",
+  "call create_upload_link, upload the file with the curl command it returns from your code execution environment,",
+  "then call edit_image with the returned image id.",
   "Write rich prompts: subject, setting, style or medium, composition, lighting, colors, mood; put any text that must appear in the image in quotes.",
   "After each call, give the user the image link from the result so they can open or download it.",
 ].join(" ");
@@ -80,6 +85,7 @@ export default {
       if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
 
       if (url.pathname.startsWith("/img/")) return await serveImage(request, env, url);
+      if (url.pathname.startsWith("/upload/")) return await handleUpload(request, env, url);
 
       if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
         return await handleMcp(request, env, ctx, url);
@@ -292,6 +298,7 @@ async function handleRequest(method, params, state) {
       return { result: { tools: toolDefinitions(state.env, state.ui) } };
     case "tools/call": {
       const name = params.name;
+      if (name === "create_upload_link") return { result: await createUploadLink(state) };
       if (name !== "generate_image" && name !== "edit_image") {
         throw new RpcError(-32602, `Unknown tool: ${name}`);
       }
@@ -422,7 +429,9 @@ function toolDefinitions(env, ui) {
       title: "Edit image",
       description:
         "Edit or remix existing images, or combine several reference images, following a text instruction. Pass image URLs returned " +
-        "by earlier generate_image/edit_image calls (or their ids, or public https image URLs). Returns a new image link.",
+        "by earlier generate_image/edit_image calls (or their ids, or public https image URLs). For an image the user attached in " +
+        "the chat, upload it first with create_upload_link and pass the returned id. For photo restoration or other faithful fixes, " +
+        "prefer gemini-nano-banana-2.1 or gpt-image-2.5-sunburst and ask to keep everything else unchanged. Returns a new image link.",
       inputSchema: {
         type: "object",
         properties: {
@@ -449,6 +458,23 @@ function toolDefinitions(env, ui) {
       },
       annotations: { title: "Edit image", ...annotations },
       ...meta,
+    },
+    {
+      name: "create_upload_link",
+      title: "Create image upload link",
+      description:
+        "Get a single-use link (valid 10 minutes) for uploading an image file to this server, such as an image the user attached " +
+        "in the chat. Upload it from your code execution environment with the curl command in the result (attachments are usually " +
+        "under /mnt/user-data/uploads/), then pass the returned image id to edit_image. PNG, JPEG or WebP, up to 20 MB. " +
+        "If curl can't reach the server, tell the user to add this server's domain to the allowed domains for code execution in Claude's settings.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      annotations: {
+        title: "Create image upload link",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
     },
   ];
 }
@@ -687,8 +713,7 @@ export function openAiSize(aspect, resolution) {
 // Storage (R2)
 // ---------------------------------------------------------------------------
 
-async function storeImage(env, origin, bytes, mimeType, meta) {
-  const id = randomId();
+async function storeImage(env, origin, bytes, mimeType, meta, id = randomId()) {
   const ext = extFor(mimeType);
   await env.IMAGES.put(`img/${id}.${ext}`, bytes, {
     httpMetadata: { contentType: mimeType, cacheControl: "public, max-age=31536000, immutable" },
@@ -718,6 +743,105 @@ async function serveImage(request, env, url) {
     `${url.searchParams.has("download") ? "attachment" : "inline"}; filename="imagegen-${name}"`,
   );
   return new Response(request.method === "HEAD" ? null : object.body, { headers });
+}
+
+// ---------------------------------------------------------------------------
+// Uploads: single-use links so Claude can push a chat attachment from its code sandbox.
+// Link format: /upload/<id>.<expires unix s>.<HMAC-SHA256(MCP_TOKEN, "upload.<id>.<expires>")>
+// Stateless: the signature proves we issued it, the expiry bounds it, and the link is spent
+// once img/<id>.* exists. Rotating MCP_TOKEN invalidates all open links. The MCP_TOKEN itself
+// is never handed to the sandbox.
+// ---------------------------------------------------------------------------
+
+async function signUpload(env, id, expires) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(env.MCP_TOKEN), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+  ]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(`upload.${id}.${expires}`));
+  return Buffer.from(sig).toString("base64url");
+}
+
+async function createUploadLink(state) {
+  const { env, origin } = state;
+  if (!env.IMAGES) {
+    return { content: [{ type: "text", text: "R2 bucket binding IMAGES is missing (see wrangler.jsonc)." }], isError: true };
+  }
+  const id = randomId();
+  const expires = Math.floor((Date.now() + UPLOAD_LINK_TTL_MS) / 1000);
+  const uploadUrl = `${origin}/upload/${id}.${expires}.${await signUpload(env, id, expires)}`;
+  const expiresAt = new Date(expires * 1000).toISOString();
+  const text = [
+    `Upload link (single use, expires ${expiresAt}):`,
+    uploadUrl,
+    "",
+    "Upload the file from your code execution environment, for example:",
+    `  curl -sS --fail-with-body -T "/mnt/user-data/uploads/<file>" "${uploadUrl}"`,
+    "",
+    `Image id after upload: ${id}`,
+    `Then call edit_image with images: ["${id}"].`,
+    "If the request is blocked by a proxy or network policy, ask the user to add this domain to the allowed domains for code execution: " +
+      new URL(origin).hostname,
+  ].join("\n");
+  return { content: [{ type: "text", text }], structuredContent: { uploadUrl, id, expiresAt } };
+}
+
+async function handleUpload(request, env, url) {
+  const fail = (status, error) =>
+    new Response(JSON.stringify({ error }) + "\n", { status, headers: { ...CORS_HEADERS, "content-type": "application/json" } });
+
+  if (request.method !== "PUT" && request.method !== "POST") {
+    return new Response("Method not allowed\n", { status: 405, headers: { ...CORS_HEADERS, allow: "PUT, POST, OPTIONS" } });
+  }
+  if (tokenProblem(env) || !env.IMAGES) return fail(500, "Server not configured.");
+
+  const m = url.pathname.match(/^\/upload\/([A-Za-z0-9_-]{16,64})\.(\d{1,12})\.([A-Za-z0-9_-]{43})$/);
+  if (!m) return fail(404, "Invalid upload link.");
+  const [, id, expires, sig] = m;
+  if (!safeEqual(sig, await signUpload(env, id, expires))) return fail(403, "Invalid upload link.");
+  if (Number(expires) * 1000 < Date.now()) return fail(410, "This upload link has expired. Call create_upload_link again.");
+  const used = await env.IMAGES.list({ prefix: `img/${id}.`, limit: 1 });
+  if (used.objects.length) return fail(409, "This upload link has already been used. Call create_upload_link again.");
+
+  const tooLarge = `Image too large (max ${MAX_INPUT_BYTES / 1048576} MB).`;
+  if (Number(request.headers.get("content-length") || 0) > MAX_INPUT_BYTES + 65536) return fail(413, tooLarge);
+
+  let bytes;
+  if ((request.headers.get("content-type") || "").toLowerCase().startsWith("multipart/form-data")) {
+    let form;
+    try {
+      form = await request.formData();
+    } catch {
+      return fail(400, "Couldn't read the multipart form.");
+    }
+    const file = [...form.values()].find((v) => typeof v !== "string");
+    if (!file) return fail(400, "No file found in the form. Use curl -T <file> <url> or curl -F file=@<file> <url>.");
+    bytes = new Uint8Array(await file.arrayBuffer());
+  } else {
+    bytes = new Uint8Array(await request.arrayBuffer());
+  }
+
+  if (bytes.length === 0) return fail(400, "The upload was empty.");
+  if (bytes.length > MAX_INPUT_BYTES) return fail(413, tooLarge);
+  const mimeType = sniffMime(bytes);
+  if (!mimeType || mimeType === "image/gif") return fail(415, "Unsupported image type (use PNG, JPEG or WebP).");
+
+  const stored = await storeImage(env, url.origin, bytes, mimeType, { tool: "upload", created: new Date().toISOString() }, id);
+  const dims = imageDimensions(bytes);
+  console.log(JSON.stringify({ event: "upload", bytes: bytes.length, mimeType, dims }));
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      id: stored.id,
+      url: stored.url,
+      mimeType,
+      bytes: bytes.length,
+      width: dims?.width ?? null,
+      height: dims?.height ?? null,
+      next: `Call edit_image with images: ["${stored.id}"].`,
+    }) + "\n",
+    { status: 201, headers: { ...CORS_HEADERS, "content-type": "application/json" } },
+  );
 }
 
 /** Resolve edit inputs: our own image URLs/ids (read from R2) or public https URLs. */
@@ -760,7 +884,11 @@ async function loadInputImages(env, origin, refs) {
         const listed = await env.IMAGES.list({ prefix: `img/${ownName}.`, limit: 1 });
         if (listed.objects[0]) object = await env.IMAGES.get(listed.objects[0].key);
       }
-      if (!object) throw new ToolError(`Image not found on this server: ${ref.slice(0, 120)}`);
+      if (!object) {
+        throw new ToolError(
+          `Image not found on this server: ${ref.slice(0, 120)}. If it came from create_upload_link, upload the file first.`,
+        );
+      }
       bytes = new Uint8Array(await object.arrayBuffer());
     }
 
