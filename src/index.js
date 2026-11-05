@@ -803,7 +803,10 @@ async function openAiImage(env, opts, inputs, sizeHint) {
 
 /** Gemini API generateContent with image output (Nano Banana models). One request per variation, run in parallel. */
 async function geminiImage(env, opts, inputs) {
-  if (opts.count === 1) return { images: [await geminiOne(env, opts, inputs)] };
+  if (opts.count === 1) {
+    const one = await geminiOne(env, opts, inputs);
+    return { images: [one], note: one.note };
+  }
   const settled = await Promise.allSettled(Array.from({ length: opts.count }, () => geminiOne(env, opts, inputs)));
   const images = settled.filter((s) => s.status === "fulfilled").map((s) => s.value);
   const failures = settled.filter((s) => s.status === "rejected");

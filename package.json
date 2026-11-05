@@ -7,9 +7,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.6.0",
+    "vitest": "^4.1.12",
     "wrangler": "^4.157.0"
   },
   "cloudflare": {

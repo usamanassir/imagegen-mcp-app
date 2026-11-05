@@ -219,17 +219,12 @@ Change these in `wrangler.jsonc` → `vars`, then run `npm run deploy`:
 
 ## How it works
 
-- `POST /mcp/<token>` is the MCP endpoint. It uses Streamable HTTP and is stateless. It supports protocol versions
-  2024-11-05 through 2025-11-25. Tool calls stream SSE keep-alives and progress while the image is being made.
-- `GET /img/<id>.<ext>` serves the images from R2. Add `?download=1` to download a file.
-- `PUT /upload/<link>` accepts one image (raw body or multipart form) for a link made by `create_upload_link`. The
-  link is `<id>.<expiry>.<HMAC signature>`, so the server keeps no state for it; it is spent once the image exists.
-- `ui://imagegen/viewer.html` is a small MCP App (spec 2026-01-26) that shows the image in the chat.
-- `list_images` reads the metadata of the stored images from R2 (prompt, model, date) and sorts them newest first.
-  It looks through at most 5,000 images.
-- A cron trigger (`triggers.crons` in `wrangler.jsonc`) runs once a day and deletes images older than
-  `RETENTION_DAYS`. To try it locally: `npx wrangler dev --test-scheduled`, then open
-  `http://localhost:8787/__scheduled`.
-- OpenAI is called through `/v1/images/generations` and `/v1/images/edits`. Google is called through
-  `models/<id>:generateContent` with image output. The code is all in `src/index.js` and `src/viewer.js` and has no
-  runtime dependencies.
+The whole server is one Cloudflare Worker (`src/index.js` and the inline viewer in `src/viewer.js`) with no runtime
+dependencies. `POST /mcp/<token>` is a stateless MCP endpoint (Streamable HTTP, protocol versions 2024-11-05 through
+2025-11-25); images are stored in R2 and served from `GET /img/<id>.<ext>`; a daily cron deletes old ones.
+
+For developers:
+
+- [docs/design.md](docs/design.md): architecture, request flow, the signed upload links, the viewer, security model.
+- [docs/api.md](docs/api.md): HTTP endpoints, tool arguments and result shapes, configuration.
+- [docs/development.md](docs/development.md): running locally, tests (`npm test`), deploying, adding models or tools.
