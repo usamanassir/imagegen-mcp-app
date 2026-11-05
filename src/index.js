@@ -511,7 +511,8 @@ function toolDefinitions(env, ui) {
         "in the chat. Upload it from your code execution environment with the curl command in the result (attachments are usually " +
         "under /mnt/user-data/uploads/), then pass the returned image id to edit_image. PNG, JPEG or WebP, up to 20 MB. " +
         "Give a short description of the image so list_images can find it later. " +
-        "If curl can't reach the server, tell the user to add this server's domain to the allowed domains for code execution in Claude's settings.",
+        "Only if the upload itself fails (curl can't connect or is blocked), tell the user to add this server's domain to the " +
+        "allowed domains for code execution in Claude's settings; otherwise don't mention it.",
       inputSchema: {
         type: "object",
         properties: {
@@ -969,8 +970,6 @@ async function createUploadLink(state, args = {}) {
     `Image id after upload: ${id}`,
     `Then call edit_image with images: ["${id}"].`,
     description ? `The image will be stored with this description: "${description}"` : "",
-    "If the request is blocked by a proxy or network policy, ask the user to add this domain to the allowed domains for code execution: " +
-      new URL(origin).hostname,
   ]
     .filter((l) => l !== "")
     .join("\n");
