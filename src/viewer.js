@@ -252,11 +252,12 @@ export const VIEWER_HTML = `<!doctype html>
         title = (im.prompt || "") + "\\n" + (im.created || "") + "\\nid " + (im.id || "");
       } else {
         var parts = [];
-        if (images.length > 1) parts.push("<b>Variation " + (i + 1) + "</b>");
+        if (im.prompt) parts.push("<b>" + esc(im.prompt.length > 60 ? im.prompt.slice(0, 60) + "…" : im.prompt) + "</b>");
+        else if (images.length > 1) parts.push("<b>Variation " + (i + 1) + "</b>");
         else if (sc.modelLabel || sc.model) parts.push(esc(sc.modelLabel || sc.model));
         if (im.width && im.height) parts.push(im.width + " × " + im.height);
         label = parts.join(" · ");
-        title = im.id ? "id " + im.id : "";
+        title = (im.prompt ? im.prompt + "\\n" : "") + (im.id ? "id " + im.id : "");
       }
       return makeCard(im, src, label, title);
     });
@@ -370,8 +371,8 @@ export const VIEWER_HTML = `<!doctype html>
       case "ui/notifications/tool-input": {
         var a = (msg.params && msg.params.arguments) || {};
         lastToolArgs = a;
-        var n = Number(a.count) || 1;
-        setStatus(a.prompt ? (n > 1 ? "Generating " + n + " images…" : "Generating image…") : "Loading…", "");
+        var n = (Number(a.count) || 1) * (Array.isArray(a.prompts) ? a.prompts.length : 1);
+        setStatus(a.prompt || a.prompts ? (n > 1 ? "Generating " + n + " images…" : "Generating image…") : "Loading…", "");
         break;
       }
       case "ui/notifications/tool-result":

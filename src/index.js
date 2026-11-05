@@ -72,7 +72,7 @@ const INSTRUCTIONS = [
   "Image generation tools.",
   "Use generate_image when the user wants a new picture (photo, illustration, logo, poster, icon, mockup art).",
   "Use edit_image to change or remix an image: pass the URL of an image returned earlier (or a public image URL).",
-  "Set count (2-4) when the user wants several variations to choose from.",
+  "Set count (2-4) when the user wants several variations of one prompt; use prompts (up to 4) when they want different versions, e.g. three styles.",
   "If the user attached an image in the chat (e.g. to restore, fix or edit it), you can't pass the attachment directly:",
   "call create_upload_link, upload the file with the curl command it returns from your code execution environment,",
   "then call edit_image with the returned image id.",
@@ -420,7 +420,16 @@ function toolDefinitions(env, ui) {
       minimum: 1,
       maximum: MAX_COUNT,
       default: 1,
-      description: `Number of variations to make in one call (1-${MAX_COUNT}). Each one is billed as a separate image.`,
+      description: `Variations per prompt (1-${MAX_COUNT}). Each one is billed as a separate image. prompts × count may not exceed ${MAX_COUNT}.`,
+    },
+    prompts: {
+      type: "array",
+      items: { type: "string" },
+      minItems: 1,
+      maxItems: MAX_COUNT,
+      description:
+        `Instead of 'prompt': up to ${MAX_COUNT} different prompts made in one call, e.g. the same logo in three styles. ` +
+        "The result is one set of images labelled by prompt, so the user can compare them.",
     },
   };
   const annotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
@@ -432,19 +441,20 @@ function toolDefinitions(env, ui) {
       title: "Generate image",
       description:
         "Create a new image from a text description. Returns a public link to the full-size image (always share it with the user) " +
-        "and the image itself so you can check the result. Set count to 2-4 for variations. Takes roughly 10-60 seconds.",
+        "and the image itself so you can check the result. Set count to 2-4 for variations of one prompt, or pass prompts for " +
+        "different versions (e.g. three styles) in one call. Takes roughly 10-60 seconds.",
       inputSchema: {
         type: "object",
         properties: {
           prompt: {
             type: "string",
             description:
-              "Detailed description: subject, setting, style or medium, composition, lighting, colors, mood. Put exact text to render in quotes.",
+              "Detailed description: subject, setting, style or medium, composition, lighting, colors, mood. Put exact text to render in quotes. " +
+              "Required unless 'prompts' is given.",
           },
           aspect_ratio: { type: "string", enum: ASPECT_RATIOS, default: "1:1", description: "Width:height of the image." },
           ...common,
         },
-        required: ["prompt"],
         additionalProperties: false,
       },
       annotations: { title: "Generate image", ...annotations },
@@ -470,7 +480,8 @@ function toolDefinitions(env, ui) {
           },
           prompt: {
             type: "string",
-            description: "What to change or create, e.g. 'make it night time, keep everything else identical'.",
+            description:
+              "What to change or create, e.g. 'make it night time, keep everything else identical'. Required unless 'prompts' is given.",
           },
           aspect_ratio: {
             type: "string",
@@ -479,7 +490,7 @@ function toolDefinitions(env, ui) {
           },
           ...common,
         },
-        required: ["images", "prompt"],
+        required: ["images"],
         additionalProperties: false,
       },
       annotations: { title: "Edit image", ...annotations },
@@ -528,9 +539,22 @@ function toolDefinitions(env, ui) {
 
 function normalizeArgs(tool, args, env) {
   if (!args || typeof args !== "object") throw new ToolError("Arguments must be an object.");
-  const prompt = typeof args.prompt === "string" ? args.prompt.trim() : "";
-  if (!prompt) throw new ToolError("'prompt' is required.");
-  if (prompt.length > MAX_PROMPT_CHARS) throw new ToolError(`'prompt' is too long (max ${MAX_PROMPT_CHARS} characters).`);
+  const clean = (p, name) => {
+    const s = typeof p === "string" ? p.trim() : "";
+    if (!s) throw new ToolError(`'${name}' must be a non-empty string.`);
+    if (s.length > MAX_PROMPT_CHARS) throw new ToolError(`'${name}' is too long (max ${MAX_PROMPT_CHARS} characters).`);
+    return s;
+  };
+  let prompts;
+  if (args.prompts !== undefined) {
+    if (args.prompt !== undefined) throw new ToolError("Pass either 'prompt' or 'prompts', not both.");
+    if (!Array.isArray(args.prompts) || !args.prompts.length) throw new ToolError("'prompts' must be a non-empty array of strings.");
+    if (args.prompts.length > MAX_COUNT) throw new ToolError(`'prompts' can hold at most ${MAX_COUNT} entries.`);
+    prompts = args.prompts.map((p, i) => clean(p, `prompts[${i}]`));
+  } else {
+    if (args.prompt === undefined) throw new ToolError("'prompt' (or 'prompts') is required.");
+    prompts = [clean(args.prompt, "prompt")];
+  }
 
   const models = availableModels(env);
   const model = args.model ?? defaultModel(env);
@@ -543,7 +567,7 @@ function normalizeArgs(tool, args, env) {
     return v;
   };
   const opts = {
-    prompt,
+    prompts,
     model,
     provider: MODELS[model].provider,
     aspectRatio: pick("aspect_ratio", ASPECT_RATIOS, tool === "generate_image" ? "1:1" : undefined),
@@ -552,6 +576,7 @@ function normalizeArgs(tool, args, env) {
     format: pick("format", FORMATS, "jpeg"),
     background: pick("background", BACKGROUNDS, undefined),
     count: 1,
+    total: prompts.length,
     images: [],
   };
   if (opts.background === "transparent" && opts.format === "jpeg") opts.format = "png";
@@ -559,6 +584,10 @@ function normalizeArgs(tool, args, env) {
     const n = Number(args.count);
     if (!Number.isInteger(n) || n < 1 || n > MAX_COUNT) throw new ToolError(`'count' must be a whole number from 1 to ${MAX_COUNT}.`);
     opts.count = n;
+    opts.total = n * prompts.length;
+    if (opts.total > MAX_COUNT) {
+      throw new ToolError(`${prompts.length} prompts × count ${n} = ${opts.total} images; at most ${MAX_COUNT} per call.`);
+    }
   }
 
   if (tool === "edit_image") {
@@ -581,18 +610,37 @@ async function runImageTool(tool, args, state) {
     }
     if (!env.IMAGES) throw new ToolError("R2 bucket binding IMAGES is missing (see wrangler.jsonc).");
 
-    const usage = await checkDailyLimit(env, opts.count);
+    const usage = await checkDailyLimit(env, opts.total);
     const inputs = tool === "edit_image" ? await loadInputImages(env, origin, opts.images) : [];
 
     // First input image decides the shape of an edit when no aspect ratio was given.
     let sizeHint = null;
     if (!opts.aspectRatio && inputs[0]?.dims) sizeHint = inputs[0].dims;
 
+    // One job per prompt, run in parallel; each job makes `count` images.
     const started = Date.now();
-    const gen =
-      opts.provider === "openai"
-        ? await openAiImage(env, opts, inputs, sizeHint)
-        : await geminiImage(env, opts, inputs);
+    const jobs = await Promise.allSettled(
+      opts.prompts.map((prompt) => {
+        const o = { ...opts, prompt };
+        return opts.provider === "openai" ? openAiImage(env, o, inputs, sizeHint) : geminiImage(env, o, inputs);
+      }),
+    );
+    const gen = { images: [], notes: [], failed: 0, failedReason: null };
+    jobs.forEach((job, i) => {
+      if (job.status === "fulfilled") {
+        for (const im of job.value.images) gen.images.push({ ...im, prompt: opts.prompts[i] });
+        if (job.value.note) gen.notes.push(job.value.note);
+        if (job.value.failed) {
+          gen.failed += job.value.failed;
+          gen.failedReason ||= job.value.failedReason;
+        }
+      } else {
+        gen.failed += opts.count;
+        gen.failedReason ||= String(job.reason?.message || job.reason).slice(0, 300);
+      }
+    });
+    if (!gen.images.length) throw jobs.find((j) => j.status === "rejected").reason;
+    gen.note = gen.notes[0];
 
     const created = new Date().toISOString();
     const results = [];
@@ -602,10 +650,10 @@ async function runImageTool(tool, args, state) {
       const stored = await storeImage(env, origin, bytes, mimeType, {
         model: opts.model,
         tool,
-        prompt: truncateUtf8(opts.prompt, 600),
+        prompt: truncateUtf8(g.prompt, 600),
         created,
       });
-      results.push({ ...stored, bytes, mimeType, dims: imageDimensions(bytes) });
+      results.push({ ...stored, bytes, mimeType, dims: imageDimensions(bytes), prompt: g.prompt });
     }
     await bumpDailyCount(env, usage, results.length);
     console.log(
@@ -613,6 +661,7 @@ async function runImageTool(tool, args, state) {
         event: "image",
         tool,
         model: opts.model,
+        prompts: opts.prompts.length,
         count: results.length,
         ms: Date.now() - started,
         bytes: results.reduce((n, r) => n + r.bytes.length, 0),
@@ -626,9 +675,11 @@ async function runImageTool(tool, args, state) {
     const content = [];
     const images = [];
     const many = results.length > 1;
+    const multiPrompt = opts.prompts.length > 1;
     results.forEach((r, i) => {
       const size = r.dims ? `${r.dims.width}x${r.dims.height}` : "unknown size";
-      lines.push(`${many ? `Image ${i + 1}: ` : "Image ready: "}${r.url}`);
+      const tag = multiPrompt ? ` (prompt: "${truncateUtf8(r.prompt, 80)}")` : "";
+      lines.push(`${many ? `Image ${i + 1}${tag}: ` : "Image ready: "}${r.url}`);
       lines.push(`${many ? "  " : ""}Image id: ${r.id} · ${size} · ${r.mimeType}`);
       const attach = budget >= r.bytes.length;
       if (attach) budget -= r.bytes.length;
@@ -640,6 +691,7 @@ async function runImageTool(tool, args, state) {
         mimeType: r.mimeType,
         bytes: r.bytes.length,
         preview: attach,
+        prompt: multiPrompt ? r.prompt : undefined,
       });
       // Re-encode from the decoded bytes so the payload is guaranteed to be plain base64.
       if (attach) content.push({ type: "image", data: r.bytes.toString("base64"), mimeType: r.mimeType });
@@ -651,7 +703,7 @@ async function runImageTool(tool, args, state) {
         : "Share the link with the user so they can open or download the full-size image. Pass it to edit_image to change it.",
     );
     if (gen.note) lines.push(`Model note: ${gen.note}`);
-    if (gen.failed) lines.push(`Note: ${gen.failed} of ${opts.count} variations failed: ${gen.failedReason}`);
+    if (gen.failed) lines.push(`Note: ${gen.failed} of ${opts.total} images failed: ${gen.failedReason}`);
     if (images.some((im) => !im.preview)) lines.push("(Some images are large and not attached here; open the links to see them.)");
 
     content.unshift({ type: "text", text: lines.join("\n") });
@@ -671,6 +723,7 @@ async function runImageTool(tool, args, state) {
         bytes: first.bytes,
         // … and the full set, plus the inputs of an edit so the viewer can show before/after.
         count: images.length,
+        prompts: opts.prompts,
         images,
         sources: inputs.map((inp) => ({ url: inp.url, id: inp.id ?? null })),
       },

@@ -129,9 +129,10 @@ To test the upload from a computer: `node scripts/check.mjs "<connector URL>" --
 
 ### Variations, history and the inline viewer
 
-- **Variations:** ask for "3 options" or "a few versions" and Claude sets `count` (up to 4). Each variation is
-  billed as one image and counts toward `DAILY_LIMIT`. The result lists every link, and you pick one to continue
-  editing.
+- **Variations:** ask for "3 options" or "a few versions" and Claude sets `count` (up to 4). For different versions,
+  such as "the logo in flat, vintage and 3D style", Claude passes `prompts` (up to 4) and you get one set of images
+  labelled by prompt. `prompts × count` is capped at 4 per call. Each image is billed separately and counts toward
+  `DAILY_LIMIT`. The result lists every link, and you pick one to continue editing.
 - **History:** say "edit the café logo from yesterday" and Claude calls `list_images`, which returns your stored
   images newest first with the prompt and model that made each one. It matches on the prompt text and date, not on
   what the image looks like, so Claude may show you the candidates and ask which one you mean. Images are only
@@ -164,7 +165,8 @@ A model only appears if its provider's key is set. Claude picks the options from
 - `quality` (OpenAI only): low, medium, high, xhigh, max or auto. The default is `DEFAULT_QUALITY` (`auto`).
 - `format` (OpenAI only): jpeg (default), png or webp.
 - `background` (OpenAI only): transparent or opaque.
-- `count`: 1 (default) to 4 variations in one call.
+- `count`: 1 (default) to 4 variations per prompt.
+- `prompts`: up to 4 different prompts in one call, instead of `prompt`.
 
 To add another model from the same providers, add a line to `MODELS` at the top of `src/index.js` and run
 `npm run deploy`.

@@ -3,6 +3,7 @@
 //
 //   node scripts/check.mjs "https://imagegen-mcp.<you>.workers.dev/mcp/<MCP_TOKEN>"
 //   node scripts/check.mjs "<connector URL>" --generate "a red bicycle in the rain" [--model gemini-nano-banana-2.1] [--count 2]
+//   node scripts/check.mjs "<connector URL>" --generate "a cat, watercolor" --generate "a cat, pencil sketch"   (several prompts)
 //   node scripts/check.mjs "<connector URL>" --upload photo.jpg
 //   node scripts/check.mjs "<connector URL>" --list [--query logo]
 //
@@ -77,6 +78,10 @@ try {
     const args = { prompt };
     if (flag("--model")) args.model = flag("--model");
     if (flag("--count")) args.count = Number(flag("--count"));
+    if (rest.filter((x) => x === "--generate").length > 1) {
+      args.prompts = rest.flatMap((x, i) => (x === "--generate" ? [rest[i + 1]] : []));
+      delete args.prompt;
+    }
     console.log("… generating (this can take up to a minute)");
     const started = Date.now();
     const result = await rpc("tools/call", { name: "generate_image", arguments: args });
