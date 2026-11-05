@@ -4,7 +4,7 @@
 //   node scripts/check.mjs "https://imagegen-mcp.<you>.workers.dev/mcp/<MCP_TOKEN>"
 //   node scripts/check.mjs "<connector URL>" --generate "a red bicycle in the rain" [--model gemini-nano-banana-2.1] [--count 2]
 //   node scripts/check.mjs "<connector URL>" --generate "a cat, watercolor" --generate "a cat, pencil sketch"   (several prompts)
-//   node scripts/check.mjs "<connector URL>" --upload photo.jpg
+//   node scripts/check.mjs "<connector URL>" --upload photo.jpg [--describe "old family photo"]
 //   node scripts/check.mjs "<connector URL>" --list [--query logo]
 //
 // The second form makes real images (billed by OpenAI/Google) and prints their links.
@@ -65,7 +65,7 @@ try {
   const prompt = flag("--generate");
   const uploadFile = flag("--upload");
   if (uploadFile) {
-    const link = await rpc("tools/call", { name: "create_upload_link", arguments: {} });
+    const link = await rpc("tools/call", { name: "create_upload_link", arguments: flag("--describe") ? { description: flag("--describe") } : {} });
     if (link.isError) throw new Error(`create_upload_link: ${link.content?.[0]?.text}`);
     const { uploadUrl, id } = link.structuredContent;
     const res = await fetch(uploadUrl, { method: "PUT", body: await readFile(uploadFile) });

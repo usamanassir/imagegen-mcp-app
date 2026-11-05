@@ -111,7 +111,8 @@ Then just ask, for example:
 Claude can't pass a chat attachment straight to an MCP tool, so it uploads the file with code instead. Attach a
 photo and ask, for example, "Restore this old photo: remove the scratches and fix the faded colors." Claude then:
 
-1. calls `create_upload_link`, which returns a single-use upload link that expires after 10 minutes,
+1. calls `create_upload_link`, with a short description of the image so `list_images` can find it later; the
+   tool returns a single-use upload link that expires after 10 minutes,
 2. uploads the file from its code sandbox with `curl`,
 3. calls `edit_image` with the new image id.
 
@@ -139,7 +140,7 @@ To test the upload from a computer: `node scripts/check.mjs "<connector URL>" --
   listed while they are stored (see `RETENTION_DAYS`).
 - **Viewer:** in apps that support MCP Apps, the result appears inline with Open, Download and Copy-link buttons,
   a grid for variations and lists, and a before/after pair for edits. On hosts that let apps call server tools, an
-  **Upload an image to edit…** button sends a file from your device and posts its id into the chat. Whether that
+  **Upload an image to edit…** button sends a file from your device, with an optional description, and posts its id into the chat. Whether that
   button appears depends on the host.
 
 **Bearer token instead of the URL token:** claude.ai's custom connector form only takes a URL, so there the token

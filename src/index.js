@@ -67,6 +67,7 @@ const MAX_LIST = 50; // images per list_images call
 const MAX_LIST_SCAN = 5000; // most stored images list_images will look through
 const DEFAULT_PREVIEW_MAX_BYTES = 1_500_000; // total preview bytes per call; larger results are linked only (keeps CPU low on the Workers Free plan)
 const UPLOAD_LINK_TTL_MS = 10 * 60 * 1000;
+const MAX_DESCRIPTION_BYTES = 200; // description of an uploaded image (stored as R2 metadata, searchable with list_images)
 
 const INSTRUCTIONS = [
   "Image generation tools.",
@@ -310,7 +311,7 @@ async function handleRequest(method, params, state) {
       return { result: { tools: toolDefinitions(state.env, state.ui) } };
     case "tools/call": {
       const name = params.name;
-      if (name === "create_upload_link") return { result: await createUploadLink(state) };
+      if (name === "create_upload_link") return { result: await createUploadLink(state, params.arguments || {}) };
       if (name === "list_images") return { result: await listImages(state, params.arguments || {}) };
       if (name !== "generate_image" && name !== "edit_image") {
         throw new RpcError(-32602, `Unknown tool: ${name}`);
@@ -380,6 +381,12 @@ function defaultModel(env) {
 
 function defaultQuality(env) {
   return QUALITIES.includes(env.DEFAULT_QUALITY) ? env.DEFAULT_QUALITY : "medium";
+}
+
+/** Models to recommend for faithful edits, limited to the ones whose provider key is set. */
+function bestEditModels(models) {
+  const picks = ["gemini-nano-banana-2.1", "gpt-image-2.5-sunburst"].filter((m) => models.includes(m));
+  return (picks.length ? picks : models.slice(0, 1)).join(" or ");
 }
 
 function toolDefinitions(env, ui) {
@@ -467,7 +474,7 @@ function toolDefinitions(env, ui) {
         "Edit or remix existing images, or combine several reference images, following a text instruction. Pass image URLs returned " +
         "by earlier generate_image/edit_image calls (or their ids, or public https image URLs). For an image the user attached in " +
         "the chat, upload it first with create_upload_link and pass the returned id. For photo restoration or other faithful fixes, " +
-        "prefer gemini-nano-banana-2.1 or gpt-image-2.5-sunburst and ask to keep everything else unchanged. Returns a new image link.",
+        `prefer ${bestEditModels(models)} and ask to keep everything else unchanged. Returns a new image link.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -503,8 +510,19 @@ function toolDefinitions(env, ui) {
         "Get a single-use link (valid 10 minutes) for uploading an image file to this server, such as an image the user attached " +
         "in the chat. Upload it from your code execution environment with the curl command in the result (attachments are usually " +
         "under /mnt/user-data/uploads/), then pass the returned image id to edit_image. PNG, JPEG or WebP, up to 20 MB. " +
+        "Give a short description of the image so list_images can find it later. " +
         "If curl can't reach the server, tell the user to add this server's domain to the allowed domains for code execution in Claude's settings.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      inputSchema: {
+        type: "object",
+        properties: {
+          description: {
+            type: "string",
+            maxLength: MAX_DESCRIPTION_BYTES,
+            description: "What the image shows, in a few words (e.g. 'old family photo, wedding 1978'). Stored with the image and searchable.",
+          },
+        },
+        additionalProperties: false,
+      },
       annotations: {
         title: "Create image upload link",
         readOnlyHint: false,
@@ -914,23 +932,29 @@ async function serveImage(request, env, url) {
 // is never handed to the sandbox.
 // ---------------------------------------------------------------------------
 
-async function signUpload(env, id, expires) {
+// Link format: /upload/<id>.<expires unix s>.<HMAC>[?d=<base64url description>]
+// HMAC-SHA256(MCP_TOKEN, "upload.<id>.<expires>.<d>") covers the description too.
+async function signUpload(env, id, expires, d = "") {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", enc.encode(env.MCP_TOKEN), { name: "HMAC", hash: "SHA-256" }, false, [
     "sign",
   ]);
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(`upload.${id}.${expires}`));
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(`upload.${id}.${expires}.${d}`));
   return Buffer.from(sig).toString("base64url");
 }
 
-async function createUploadLink(state) {
+async function createUploadLink(state, args = {}) {
   const { env, origin } = state;
   if (!env.IMAGES) {
     return { content: [{ type: "text", text: "R2 bucket binding IMAGES is missing (see wrangler.jsonc)." }], isError: true };
   }
+  let description = typeof args.description === "string" ? args.description.replace(/\s+/g, " ").trim() : "";
+  if (description) description = truncateUtf8(description, MAX_DESCRIPTION_BYTES);
+  const d = description ? Buffer.from(description).toString("base64url") : "";
+
   const id = randomId();
   const expires = Math.floor((Date.now() + UPLOAD_LINK_TTL_MS) / 1000);
-  const uploadUrl = `${origin}/upload/${id}.${expires}.${await signUpload(env, id, expires)}`;
+  const uploadUrl = `${origin}/upload/${id}.${expires}.${await signUpload(env, id, expires, d)}${d ? `?d=${d}` : ""}`;
   const expiresAt = new Date(expires * 1000).toISOString();
   const text = [
     `Upload link (single use, expires ${expiresAt}):`,
@@ -941,10 +965,13 @@ async function createUploadLink(state) {
     "",
     `Image id after upload: ${id}`,
     `Then call edit_image with images: ["${id}"].`,
+    description ? `The image will be stored with this description: "${description}"` : "",
     "If the request is blocked by a proxy or network policy, ask the user to add this domain to the allowed domains for code execution: " +
       new URL(origin).hostname,
-  ].join("\n");
-  return { content: [{ type: "text", text }], structuredContent: { uploadUrl, id, expiresAt } };
+  ]
+    .filter((l) => l !== "")
+    .join("\n");
+  return { content: [{ type: "text", text }], structuredContent: { uploadUrl, id, expiresAt, description: description || null } };
 }
 
 async function handleUpload(request, env, url) {
@@ -959,7 +986,10 @@ async function handleUpload(request, env, url) {
   const m = url.pathname.match(/^\/upload\/([A-Za-z0-9_-]{16,64})\.(\d{1,12})\.([A-Za-z0-9_-]{43})$/);
   if (!m) return fail(404, "Invalid upload link.");
   const [, id, expires, sig] = m;
-  if (!safeEqual(sig, await signUpload(env, id, expires))) return fail(403, "Invalid upload link.");
+  const d = url.searchParams.get("d") || "";
+  if (!/^[A-Za-z0-9_-]{0,400}$/.test(d)) return fail(404, "Invalid upload link.");
+  if (!safeEqual(sig, await signUpload(env, id, expires, d))) return fail(403, "Invalid upload link.");
+  const description = d ? Buffer.from(d, "base64url").toString("utf8") : "";
   if (Number(expires) * 1000 < Date.now()) return fail(410, "This upload link has expired. Call create_upload_link again.");
   const used = await env.IMAGES.list({ prefix: `img/${id}.`, limit: 1 });
   if (used.objects.length) return fail(409, "This upload link has already been used. Call create_upload_link again.");
@@ -992,7 +1022,9 @@ async function handleUpload(request, env, url) {
   const mimeType = sniffMime(bytes);
   if (!mimeType || mimeType === "image/gif") return fail(415, "Unsupported image type (use PNG, JPEG or WebP).");
 
-  const stored = await storeImage(env, url.origin, bytes, mimeType, { tool: "upload", created: new Date().toISOString() }, id);
+  const meta = { tool: "upload", created: new Date().toISOString() };
+  if (description) meta.description = description;
+  const stored = await storeImage(env, url.origin, bytes, mimeType, meta, id);
   const dims = imageDimensions(bytes);
   console.log(JSON.stringify({ event: "upload", bytes: bytes.length, mimeType, dims }));
   return new Response(
@@ -1154,9 +1186,10 @@ async function listImages(state, args) {
         tool: meta.tool || "unknown",
         model: meta.model || null,
         prompt: meta.prompt || null,
+        description: meta.description || null,
         bytes: o.size,
       };
-      if (query && !`${item.prompt || ""} ${item.model || ""} ${item.id}`.toLowerCase().includes(query)) continue;
+      if (query && !`${item.prompt || ""} ${item.description || ""} ${item.model || ""} ${item.id}`.toLowerCase().includes(query)) continue;
       items.push(item);
     }
     scanned += page.objects.length;
@@ -1177,7 +1210,8 @@ async function listImages(state, args) {
     );
     for (const im of images) {
       const what = im.tool === "upload" ? "uploaded by the user" : `${im.tool} with ${im.model || "unknown model"}`;
-      const prompt = im.prompt ? ` · "${im.prompt.length > 160 ? `${im.prompt.slice(0, 160)}…` : im.prompt}"` : "";
+      const label = im.prompt || im.description;
+      const prompt = label ? ` · "${label.length > 160 ? `${label.slice(0, 160)}…` : label}"` : "";
       lines.push(`- ${im.created.slice(0, 16).replace("T", " ")} UTC · id ${im.id} · ${what}${prompt} · ${im.url}`);
     }
     if (total > images.length) lines.push(`(${total - images.length} more; raise limit or narrow query to see them.)`);

@@ -51,8 +51,10 @@ export const VIEWER_HTML = `<!doctype html>
   #sources img { height: 64px; width: auto; border-radius: 6px; background: var(--bg2); }
   #footer { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
   #toast { font-size: 12px; color: var(--muted); margin-top: 6px; min-height: 1em; }
-  #copybox { width: 100%; box-sizing: border-box; font: inherit; font-size: 12px; padding: 4px 6px; margin-top: 6px;
+  #copybox, #desc { box-sizing: border-box; font: inherit; font-size: 12px; padding: 4px 6px;
              border: 1px solid var(--line); border-radius: 6px; color: var(--fg); background: transparent; }
+  #copybox { width: 100%; margin-top: 6px; }
+  #desc { width: 200px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -69,6 +71,7 @@ export const VIEWER_HTML = `<!doctype html>
   </div>
   <div id="footer" hidden>
     <button id="uploadBtn" type="button">Upload an image to edit…</button>
+    <input id="desc" type="text" maxlength="200" placeholder="Description (optional)">
     <input id="file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
     <span id="uploadText"></span>
   </div>
@@ -248,8 +251,9 @@ export const VIEWER_HTML = `<!doctype html>
       var label, title;
       if (isList) {
         var what = im.tool === "upload" ? "uploaded" : (im.model || im.tool || "");
-        label = "<b>" + esc(fmtDate(im.created)) + "</b> · " + esc(what) + (im.prompt ? " · " + esc(im.prompt) : "");
-        title = (im.prompt || "") + "\\n" + (im.created || "") + "\\nid " + (im.id || "");
+        var desc = im.prompt || im.description || "";
+        label = "<b>" + esc(fmtDate(im.created)) + "</b> · " + esc(what) + (desc ? " · " + esc(desc) : "");
+        title = desc + "\\n" + (im.created || "") + "\\nid " + (im.id || "");
       } else {
         var parts = [];
         if (im.prompt) parts.push("<b>" + esc(im.prompt.length > 60 ? im.prompt.slice(0, 60) + "…" : im.prompt) + "</b>");
@@ -320,7 +324,8 @@ export const VIEWER_HTML = `<!doctype html>
     el("uploadBtn").disabled = true;
     setUploadText("Uploading " + file.name + "…");
     var info = null;
-    request("tools/call", { name: "create_upload_link", arguments: {} })
+    var description = el("desc").value.trim();
+    request("tools/call", { name: "create_upload_link", arguments: description ? { description: description } : {} })
       .then(function (res) {
         var sc = (res && res.structuredContent) || {};
         if (res && res.isError || !sc.uploadUrl) throw new Error(textOf(res) || "Couldn't get an upload link.");
@@ -332,7 +337,9 @@ export const VIEWER_HTML = `<!doctype html>
         try { j = JSON.parse(r.text); } catch (e) { /* ignore */ }
         if (!r.ok) throw new Error(j.error || ("Upload failed (HTTP " + r.status + ")."));
         info = j;
-        var text = "I uploaded an image to the image server (id " + j.id + ", " + j.url + "). Please use it for the edit I asked for.";
+        el("desc").value = "";
+        var text = "I uploaded an image to the image server (id " + j.id + ", " + j.url + ")" +
+          (description ? ": " + description : "") + ". Please use it for the edit I asked for.";
         return request("ui/message", { role: "user", content: [{ type: "text", text: text }] })
           .then(function () { setUploadText("Uploaded. Its id was sent to the chat: " + j.id); })
           .catch(function () {
